@@ -1,4 +1,4 @@
-# Minfolio (Kindle)
+# Minfolio for Kindle
 
 A native KOReader **live-styled Markdown editor** for a jailbroken Kindle Paperwhite 5. It renders
 header/bold/italic/code/list styling as you type, renders pipe tables in reader mode with direct cell
