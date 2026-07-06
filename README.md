@@ -93,6 +93,13 @@ jq empty minfolio-kual/menu.json
 sh -n scripts/deploy.sh minfolio-kual/bin/notes.sh
 ```
 
+## Sister app
+
+**[Minfolio](https://github.com/kal-kaliper/minfolio)** is the desktop and mobile counterpart: a clean,
+minimalist WYSIWYG Markdown editor and mind-mapping app for macOS, Android, and Meta Quest, built to
+work alongside LLMs. Both apps edit plain `.md` files, so notes you write on the Kindle open right up in
+Minfolio on your other devices.
+
 ## License
 
 Minfolio is licensed under AGPL-3.0-only, matching KOReader's strong copyleft license family. See
