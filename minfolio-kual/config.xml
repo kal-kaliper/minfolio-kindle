@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <extension>
 	<information>
-		<name>Minfolio for Kindle</name>
+		<name>Minfolio Markdown Editor for Kindle</name>
 		<version>1.0</version>
 		<author>kal</author>
 		<id>minfolio</id>

@@ -1,22 +1,39 @@
-# Minfolio for Kindle
+# Minfolio Markdown Editor for Kindle
 
-A native KOReader **live-styled Markdown editor** for a jailbroken Kindle Paperwhite 5. It renders
-header/bold/italic/code/list styling as you type, renders pipe tables in reader mode with direct cell
-editing, and provides an overlay caret, word wrap, undo/redo, selection + copy/paste, on-screen and
-Bluetooth keyboards, a rendered reader mode, and A−/A+ zoom.
-Notes are saved as `.md` to `/mnt/us/notes`.
+**A simple, distraction-free Markdown editor and word processor for your Kindle.**
 
-Minfolio is the standalone notes editor plugin and KUAL launcher.
+Minfolio turns a jailbroken Kindle into a comfortable writing device: weeks of battery, a glare-free
+e-ink screen, and nothing on it but your words. You type in plain Markdown and watch it style itself
+as you go, with headings, bold, italic, code, and lists rendered live while you write. Your work saves
+automatically as ordinary `.md` files you can sync anywhere.
 
-## Layout
+## Why write on a Kindle
 
-| Path | Role |
-|---|---|
-| `minfolio.koplugin/main.lua` | The plugin: `MDEdit` editor, Markdown renderer, notes browser, plugin entry. |
-| `minfolio.koplugin/_meta.lua` | Plugin metadata. |
-| `minfolio.koplugin/config.example.lua` | Optional local config template. Copy to `config.lua` on the device to override defaults. |
-| `minfolio-kual/` | KUAL extension: `config.xml`, `menu.json`, `bin/notes.sh`. |
-| `scripts/deploy.sh` | Parse-check + `scp` to the device + restart KOReader. |
+- **No distractions.** No browser, no notifications, no feed. Just the page.
+- **Easy on the eyes.** E-ink is paper-like and readable in bright sun, with no backlight fatigue.
+- **All-day (all-week) battery.** Write for hours; charge rarely.
+- **Light and pocketable.** Pair a Bluetooth keyboard and you have a featherweight writing setup.
+- **Plain files you own.** Everything is Markdown on disk, not locked in an app.
+
+## Features
+
+- **Live styling as you type** — headings, **bold**, *italic*, `code`, and lists render inline while you write.
+- **Tables** — write pipe tables and edit cells directly in a rendered reader view.
+- **Reader mode** — flip from editing to a clean, fully rendered view of your document.
+- **Real editing** — overlay caret, word wrap, undo/redo, selection, and copy/paste.
+- **Type your way** — on-screen keyboard or a paired Bluetooth keyboard.
+- **Adjustable text size** — A−/A+ zoom for comfortable writing.
+- **Autosaves to Markdown** — notes are stored as `.md` in `/mnt/us/notes`, ready to sync.
+- **Built-in notes browser** — open, create, and switch between notes without leaving the app.
+
+## Requirements
+
+Minfolio is built and tested on a **jailbroken Kindle Paperwhite 5**. It runs as a
+[KOReader](https://github.com/koreader/koreader) plugin launched from
+[KUAL](https://www.mobileread.com/forums/showthread.php?t=225030), so other KOReader-capable Kindles
+may work too, though only the Paperwhite 5 is tested.
+
+You will need a jailbroken Kindle with KOReader and KUAL already installed.
 
 ## Install
 
@@ -35,33 +52,40 @@ mkdir -p /mnt/us/extensions/minfolio
 cp -R minfolio-kual/* /mnt/us/extensions/minfolio/
 ```
 
-The launcher writes `notes` to `/tmp/minfolio_launch` and starts KOReader through
-`/mnt/us/koreader/koreader.sh --kual`.
+Then open Minfolio from the KUAL menu. (The launcher writes `notes` to `/tmp/minfolio_launch` and
+starts KOReader through `/mnt/us/koreader/koreader.sh --kual`.)
 
 ## Config
 
-Minfolio works without a config file. Defaults:
+Minfolio works with no configuration. The defaults are:
 
 ```lua
-notes_dir = "/mnt/us/notes"
-state_dir = "/mnt/us/minfolio"
-minfolio_scale = 1.0
+notes_dir      = "/mnt/us/notes"     -- where your .md files live
+state_dir      = "/mnt/us/minfolio"  -- where app state is stored
+minfolio_scale = 1.0                 -- text zoom level
 ```
 
-To override them, copy `minfolio.koplugin/config.example.lua` to
-`/mnt/us/koreader/plugins/minfolio.koplugin/config.lua` and edit it on the device. The real
-`config.lua` is gitignored so local paths and device-specific settings are not committed.
+To change them, copy `minfolio.koplugin/config.example.lua` to
+`/mnt/us/koreader/plugins/minfolio.koplugin/config.lua` and edit it on the device. Your `config.lua`
+is gitignored, so device-specific paths stay local.
 
-## Development Deploy
+## Project layout
 
-The device is reached over SSH (`ssh kindle`, or `kindle.local`). Deploy = parse-check with the
-device's own LuaJIT, `scp` `main.lua` to `/mnt/us/koreader/plugins/minfolio.koplugin/`, then restart
-KOReader. See `scripts/deploy.sh`.
+| Path | Role |
+|---|---|
+| `minfolio.koplugin/main.lua` | The plugin: `MDEdit` editor, Markdown renderer, notes browser, plugin entry. |
+| `minfolio.koplugin/_meta.lua` | Plugin metadata. |
+| `minfolio.koplugin/config.example.lua` | Optional local config template. |
+| `minfolio-kual/` | KUAL launcher: `config.xml`, `menu.json`, `bin/notes.sh`. |
+| `scripts/deploy.sh` | Developer helper: parse-check, `scp` to the device, restart KOReader. |
 
-A Lua syntax error makes KOReader silently skip the whole plugin — always parse-check before trusting
-a deploy.
+## Development
 
-## Validation
+Deploy over SSH (`ssh kindle`, or `kindle.local`): parse-check with the device's own LuaJIT, `scp`
+`main.lua` to the plugin directory, then restart KOReader. See `scripts/deploy.sh`.
+
+A Lua syntax error makes KOReader silently skip the whole plugin, so always parse-check before trusting
+a deploy:
 
 ```sh
 luajit -e 'local f,e=loadfile("minfolio.koplugin/main.lua"); if not f then print(e); os.exit(1) else print("PARSE OK") end'
@@ -71,4 +95,10 @@ sh -n scripts/deploy.sh minfolio-kual/bin/notes.sh
 
 ## License
 
-Minfolio is licensed under AGPL-3.0-only, matching KOReader's strong copyleft license family.
+Minfolio is licensed under AGPL-3.0-only, matching KOReader's strong copyleft license family. See
+[`LICENSE`](LICENSE).
+
+## Trademark
+
+Kindle is a trademark of Amazon. Minfolio is an independent project and is not affiliated with,
+endorsed by, or sponsored by Amazon. "for Kindle" describes compatibility only.
