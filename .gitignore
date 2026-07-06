@@ -1,0 +1,7 @@
+*.luac
+*.bak
+*.bak-*
+.DS_Store
+.codex-plans/
+minfolio.koplugin/config.lua
+scripts/dropbear-screensaver-watchdog.*

@@ -1,0 +1,5 @@
+{
+	"items": [
+	{ "name": "Open Minfolio", "priority": 0, "action": "/mnt/us/extensions/minfolio/bin/notes.sh", "exitmenu": true, "status": false }
+	]
+}
