@@ -293,12 +293,17 @@ local function md_tokenize(textstr)
                     rest = taskrest
                 end
                 for _, s in ipairs(md_inline(rest)) do spans[#spans+1] = s end
-                lines[#lines+1] = { block = "bullet", spans = spans }
+                -- Keep the leading whitespace so nested items render indented; the
+                -- marker span's display drops it (fixed glyph), so the indent is
+                -- reapplied as real horizontal space in layoutLine.
+                lines[#lines+1] = { block = "bullet", spans = spans, indent_ws = pre:match("^%s*") or "" }
             else
                 local task, taskrest = line:match("^(%s*%[[ xX]%]%s+)(.*)$")
                 if task then
                     local checked = task:match("%[[xX]%]") ~= nil
-                    lines[#lines+1] = with_prefix(task, taskrest, "bullet", checked and "\226\152\145 " or "\226\152\144 ", "task")
+                    local tok = with_prefix(task, taskrest, "bullet", checked and "\226\152\145 " or "\226\152\144 ", "task")
+                    tok.indent_ws = task:match("^%s*") or ""
+                    lines[#lines+1] = tok
                 else
                     if line:match("^>%s?") then
                         pre, rest = line:match("^(>%s?)(.*)$")
@@ -951,7 +956,15 @@ end
 function MDEdit:layoutLine(toks, availw)
     local rows, byte = {}, 0
     local hanging = 0
+    local base_indent = 0
     if toks.block == "bullet" then
+        -- Nesting depth: leading whitespace becomes real horizontal indent (the
+        -- marker glyph itself carries no indent). Continuation rows hang under the
+        -- text, so they start at base_indent + marker width.
+        if toks.indent_ws and toks.indent_ws ~= "" then
+            base_indent = self:wordw(toks.indent_ws, "bullet")
+        end
+        hanging = base_indent
         for _, span in ipairs(toks.spans) do
             local raw = span.text or ""
             local display = span.display
@@ -963,7 +976,7 @@ function MDEdit:layoutLine(toks, availw)
         indent = indent or 0
         return { segs = {}, w = indent, sb = sb or 0, indent = indent }
     end
-    local row = newRow(0, 0)
+    local row = newRow(base_indent, 0)
     for _, span in ipairs(toks.spans) do
         local raw = span.text or ""
         local display = span.display
@@ -2211,7 +2224,13 @@ function MDEdit:onKeyPress(key)
     elseif page_up_key(name) then self.sel = nil; self:pageUp()
     elseif page_down_key(name) then self.sel = nil; self:pageDown()
     elseif name == "Space" or name == "space" or name == " " then if keymod(m, "Alt") then self.sel = nil; self:wordRight() else self:addChars(" ") end
-    elseif name == "Tab" then self:addChars("  ")
+    elseif name == "ISO_Left_Tab" or name == "BackTab" then self:indentLine(-1)
+    elseif name == "Tab" then
+        if keymod(m, "Shift") then self:indentLine(-1)
+        else
+            local _, kind, _, task = md_split_line_prefix(self.lines[self.crow])
+            if kind or task then self:indentLine(1) else self:addChars("  ") end
+        end
     elseif name == "Home" then self:goToStartOfLine()
     elseif name == "End" then self:goToEndOfLine()
     elseif KEYPAD_CHAR[name] then self:addChars(KEYPAD_CHAR[name])
@@ -2312,6 +2331,30 @@ function MDEdit:setLinePrefix(kind, want_task)
     self.lines[self.crow] = new_prefix .. body
     self.ccol = math.max(0, self.ccol + #new_prefix - #old_prefix)
     self:refresh()
+end
+-- Indent (dir > 0) or outdent (dir < 0) the current logical line by one level
+-- (INDENT_UNIT). Nesting is stored as leading whitespace; layoutLine turns it
+-- into visual indent. Returns true if the line changed.
+function MDEdit:indentLine(dir)
+    local INDENT_UNIT = "  "
+    local line = self.lines[self.crow]
+    local indent, rest = line:match("^(%s*)(.*)$")
+    local new_indent
+    if dir > 0 then
+        new_indent = INDENT_UNIT .. indent
+    elseif indent:sub(1, #INDENT_UNIT) == INDENT_UNIT then
+        new_indent = indent:sub(#INDENT_UNIT + 1)
+    elseif #indent > 0 then
+        new_indent = ""                       -- collapse a stray partial indent
+    else
+        return false                          -- already at column 0, nothing to do
+    end
+    self:snapshot(); self._burst = nil
+    local newline = new_indent .. rest
+    self.lines[self.crow] = newline
+    self.ccol = math.max(0, math.min(#newline, self.ccol + (#newline - #line)))
+    self:refresh()
+    return true
 end
 function MDEdit:fmtToggle(findpat, prefix)  -- remove existing line prefix, else add it
     self:snapshot(); self._burst = nil
