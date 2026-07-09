@@ -7,8 +7,8 @@ local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local OverlapGroup = require("ui/widget/overlapgroup")
-local RightContainer = require("ui/widget/container/rightcontainer")
 local CenterContainer = require("ui/widget/container/centercontainer")
+local BottomContainer = require("ui/widget/container/bottomcontainer")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
@@ -17,12 +17,15 @@ local HorizontalSpan = require("ui/widget/horizontalspan")
 local LineWidget = require("ui/widget/linewidget")
 local Menu = require("ui/widget/menu")
 local TextWidget = require("ui/widget/textwidget")
+local IconWidget = require("ui/widget/iconwidget")
 local Font = require("ui/font")
 Font.fontmap.ifont = Font.fontmap.ifont or "NotoSans-Italic.ttf"
 local Blitbuffer = require("ffi/blitbuffer")
 local UIManager = require("ui/uimanager")
+local Event = require("ui/event")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local InputDialog = require("ui/widget/inputdialog")
+local ConfirmBox = require("ui/widget/confirmbox")
 local Notification = require("ui/widget/notification")
 local lfs = require("libs/libkoreader-lfs")
 local socket = require("socket")
@@ -80,6 +83,12 @@ local function read_file(path)
     local data = f:read("*a")
     f:close()
     return data
+end
+local function split_text_lines(text)
+    local lines = {}
+    for line in (tostring(text or "") .. "\n"):gmatch("(.-)\n") do lines[#lines+1] = line end
+    if #lines == 0 then lines = { "" } end
+    return lines
 end
 local function read_frontlight_state()
     local ok, state = pcall(dofile, FL_STATE_PATH)
@@ -399,6 +408,27 @@ local SHIFT_SYM = {
     ["1"]="!", ["2"]="@", ["3"]="#", ["4"]="$", ["5"]="%", ["6"]="^", ["7"]="&", ["8"]="*", ["9"]="(", ["0"]=")",
     ["-"]="_", ["="]="+", ["["]="{", ["]"]="}", ["\\"]="|", [";"]=":", ["'"]='"', [","]="<", ["."]=">", ["/"]="?", ["`"]="~",
 }
+local KEYPAD_CHAR = {
+    KP0 = "0", KP1 = "1", KP2 = "2", KP3 = "3", KP4 = "4", KP5 = "5", KP6 = "6", KP7 = "7", KP8 = "8", KP9 = "9",
+    KPMinus = "-", KPPlus = "+", KPDot = ".",
+}
+local KEYBOARD_EVENT_MAP = {
+    [1]="Back", [2]="1", [3]="2", [4]="3", [5]="4", [6]="5", [7]="6", [8]="7", [9]="8", [10]="9", [11]="0",
+    [12]="-", [13]="=", [14]="Backspace", [15]="Tab",
+    [16]="Q", [17]="W", [18]="E", [19]="R", [20]="T", [21]="Y", [22]="U", [23]="I", [24]="O", [25]="P",
+    [26]="[", [27]="]", [28]="Press", [29]="Ctrl",
+    [30]="A", [31]="S", [32]="D", [33]="F", [34]="G", [35]="H", [36]="J", [37]="K", [38]="L", [39]=";", [40]="'",
+    [41]="`", [42]="Shift", [43]="\\",
+    [44]="Z", [45]="X", [46]="C", [47]="V", [48]="B", [49]="N", [50]="M", [51]=",", [52]=".", [53]="/",
+    [54]="Shift", [56]="Alt", [57]=" ", [58]="CapsLock",
+    [59]="F1", [60]="F2", [61]="F3", [62]="F4", [63]="F5", [64]="F6", [65]="F7", [66]="F8", [67]="F9", [68]="F10",
+    [69]="NumLock", [70]="ScrollLock",
+    [71]="KP7", [72]="KP8", [73]="KP9", [74]="KPMinus", [75]="KP4", [76]="KP5", [77]="KP6", [78]="KPPlus",
+    [79]="KP1", [80]="KP2", [81]="KP3", [82]="KP0", [83]="KPDot", [87]="F11", [88]="F12", [96]="Press",
+    [97]="Ctrl", [98]="Home", [99]="PrintScr", [100]="Alt", [102]="Home", [103]="Up", [104]="PageUp",
+    [105]="Left", [106]="Right", [107]="End", [108]="Down", [109]="PageDown", [110]="Ins", [111]="Del",
+    [114]="VMinus", [115]="VPlus", [116]="Power", [119]="Pause", [125]="Meta", [126]="Meta", [127]="Menu", [139]="Menu",
+}
 -- UTF-8 cursor helpers: move/delete by whole characters, not bytes (continuation bytes are 0x80..0xBF)
 local function utf8_left(s, c)
     if c <= 0 then return 0 end
@@ -449,15 +479,78 @@ local function next_word_col(s, c)
 end
 local function keymod(mods, name)
     if not mods then return nil end
+    if type(mods) == "string" then
+        return mods == name or mods:lower() == name:lower()
+    end
     if mods[name] or mods[name:lower()] or mods[name:upper()] then return true end
     if name == "Ctrl" then return mods.LCtrl or mods.RCtrl end
     if name == "Alt" then return mods.LAlt or mods.RAlt end
     if name == "Meta" then return mods.LMeta or mods.RMeta end
+    if name == "Shift" then return mods.LShift or mods.RShift end
+    for _, mod in pairs(mods) do
+        if type(mod) == "string" and (mod == name or mod:lower() == name:lower()) then return true end
+    end
     return nil
 end
 local function shortcut_mod(mods)
     return keymod(mods, "Ctrl") or keymod(mods, "Meta") or keymod(mods, "Cmd")
         or keymod(mods, "Command") or keymod(mods, "Gui") or keymod(mods, "Super")
+end
+local function word_key_mod(mods)
+    return keymod(mods, "Alt") or shortcut_mod(mods)
+end
+local function fn_key_mod(mods)
+    return keymod(mods, "Fn") or keymod(mods, "Function") or keymod(mods, "Mod5")
+end
+local function key_mods(key)
+    local out = {}
+    if Device.input and type(Device.input.modifiers) == "table" then
+        for k, v in pairs(Device.input.modifiers) do out[k] = v end
+    end
+    if key and type(key.modifiers) == "table" then
+        for k, v in pairs(key.modifiers) do out[k] = v end
+    end
+    if key then
+        for _, name in ipairs({
+            "Shift", "LShift", "RShift",
+            "Ctrl", "LCtrl", "RCtrl",
+            "Alt", "LAlt", "RAlt",
+            "Meta", "LMeta", "RMeta",
+            "Cmd", "Command", "Gui", "Super",
+            "Fn", "Function", "Mod5",
+        }) do
+            if key[name] then out[name] = true end
+        end
+    end
+    return out
+end
+local function install_keyboard_aliases()
+    local input = Device.input
+    if not input then return end
+    local em = input.event_map
+    if em then
+        for code, name in pairs(KEYBOARD_EVENT_MAP) do
+            em[code] = name
+        end
+    end
+    local mods = input.modifiers
+    if mods then
+        mods.Alt = mods.Alt or false
+        mods.Ctrl = mods.Ctrl or false
+        mods.Shift = mods.Shift or false
+        mods.Meta = mods.Meta or false
+        mods.LAlt = mods.LAlt or false
+        mods.RAlt = mods.RAlt or false
+        mods.LCtrl = mods.LCtrl or false
+        mods.RCtrl = mods.RCtrl or false
+        mods.LShift = mods.LShift or false
+        mods.RShift = mods.RShift or false
+        mods.LMeta = mods.LMeta or false
+        mods.RMeta = mods.RMeta or false
+        mods.Fn = mods.Fn or false
+        mods.Function = mods.Function or false
+        mods.Mod5 = mods.Mod5 or false
+    end
 end
 local function page_up_key(name)
     return name == "PageUp" or name == "Page_Up" or name == "PgUp" or name == "Prior"
@@ -497,9 +590,32 @@ end
 local function is_markdown_file(name)
     return tostring(name or ""):lower():match("%.md$") ~= nil
 end
-local new_note, open_markdown_picker   -- fwd decls
+local function file_signature(path)
+    local ok, attr = pcall(lfs.attributes, path)
+    if not ok or type(attr) ~= "table" then return nil end
+    return {
+        mode = attr.mode or "",
+        size = tonumber(attr.size) or 0,
+        modification = tonumber(attr.modification) or 0,
+    }
+end
+local function same_file_signature(a, b)
+    if a == b then return true end
+    if not a or not b then return false end
+    return a.mode == b.mode and a.size == b.size and a.modification == b.modification
+end
+local open_markdown_picker, rotate_screen_ccw   -- fwd decls
 local function notify(text)
     UIManager:show(Notification:new{ text = text, timeout = 3 })
+end
+local wake_repaint_pending = false
+local function schedule_wake_repaint()
+    if wake_repaint_pending then return end
+    wake_repaint_pending = true
+    UIManager:scheduleIn(1.0, function()
+        wake_repaint_pending = false
+        UIManager:setDirty("all", "full")
+    end)
 end
 local MDEDIT_PAD = 40
 local MDEDIT_TOPBAR_H = 56
@@ -509,23 +625,26 @@ local MDEDIT_TOOL_DIVIDER = 1
 local MDEDIT_TITLE_ACTION_GAP = 18
 local MDEDIT_MENU_W = 52
 local MDEDIT_TITLE_W = 360
-local MDEDIT_SCROLLBAR_W = 12
+local MDEDIT_PROGRESS_H = 2
+local MDEDIT_PROGRESS_GAP = 10
 local MDEDIT_LINE_HEIGHT = 0.80
 local MDEDIT_LINE_GAP = 0
-local MDEDIT_PARA_GAP = 22
+local MDEDIT_PARA_GAP = 12
 local MDEDIT_CARET_BLINK = 0.55
 local MDEDIT_SELECT_PAN_MIN = 18
 local MDEDIT_EDIT_SCROLL_PAN_MIN = 42
 local MDEDIT_PAGE_PAN_MIN = 24   -- min vertical drag (px) that triggers a page turn
-local MDEDIT_EDIT_DTAP = 0.20    -- edit-mode double-tap must be deliberate; second slow tap moves cursor
-local MDEDIT_EDIT_DTAP_MOVE = 14
+local MDEDIT_EDIT_DTAP = 0.22    -- edit-mode double-tap must be deliberate; same cursor cell prevents reposition taps selecting
+local MDEDIT_EDIT_DTAP_MOVE = 18
 local MDEDIT_READER_DTAP = 0.25  -- reader double-tap must land within this fast window (also the single-tap page delay)
 local MDEDIT_READER_EDGE = 130   -- reader taps within this many px of the L/R/bottom edge are page-turns, never an exit
 local MDEDIT_AUTOSAVE_DELAY = 1.0
+local MDEDIT_FILE_RELOAD_INTERVAL = 2.0
 local MDEDIT_KEYBOARD_SWIPE_EDGE = 90
 local MDEDIT_KEYBOARD_SWIPE_DY = 35
 local MDEdit = InputContainer:extend{ path = nil, on_close = nil, is_always_active = true }
 function MDEdit:init()
+    install_keyboard_aliases()
     self.fw, self.fh = Screen:getWidth(), Screen:getHeight()
     self.dimen = Geom:new{ x = 0, y = 0, w = self.fw, h = self.fh }
     self.covers_fullscreen = true
@@ -538,10 +657,10 @@ function MDEdit:init()
     self.caret_on = true
     self._caret_blinking = true
     self.reader_mode = false
-    local f = io.open(self.path, "r"); local text = f and f:read("*a") or ""; if f then f:close() end
-    self.lines = {}
-    for line in (text .. "\n"):gmatch("(.-)\n") do self.lines[#self.lines+1] = line end
-    if #self.lines == 0 then self.lines = { "" } end
+    local text = read_file(self.path) or ""
+    self.lines = split_text_lines(text)
+    self._file_signature = file_signature(self.path)
+    self._file_text = text
     self.crow, self.ccol, self.top, self.vtop = 1, 0, 1, 1
     if Device:isTouchDevice() then
         self.ges_events = {
@@ -561,6 +680,7 @@ function MDEdit:init()
     end
     self:rebuild()
     self:scheduleCaretBlink()
+    self:scheduleFilePoll()
 end
 -- a thin caret bar that sits between styled spans without disturbing them
 function MDEdit:caret(h)
@@ -650,30 +770,35 @@ function MDEdit:toolDivider()
     return CenterContainer:new{ dimen = Geom:new{ w = MDEDIT_TOOL_DIVIDER, h = MDEDIT_TOPBAR_H },
         LineWidget:new{ background = Blitbuffer.Color8(205), dimen = Geom:new{ w = MDEDIT_TOOL_DIVIDER, h = math.floor(MDEDIT_TOPBAR_H * 0.62) } } }
 end
-function MDEdit:scrollbar(content_h)
+function MDEdit:progressBar(width)
     local visual_count = self.visual_count or #self.lines
     local visible = self.visible_vrows or 16
-    if visual_count <= visible then return nil end
-    local track_h = math.max(30, content_h)
-    -- Thumb height = fraction of the document currently visible.
-    local thumb_h = math.max(36, math.floor(track_h * math.min(1, visible / visual_count)))
-    -- Scroll range is the topmost row (1) to the last row that can sit at top.
-    local max_top = math.max(1, visual_count - visible + 1)
-    local y = 0
-    if max_top > 1 then y = math.floor((track_h - thumb_h) * (((self.vtop or 1) - 1) / (max_top - 1))) end
-    return VerticalGroup:new{
-        VerticalSpan:new{ width = y },
-        LineWidget:new{ background = Blitbuffer.Color8(120), dimen = Geom:new{ w = 3, h = thumb_h } },
-    }
+    local w = math.max(1, width or 1)
+    local filled = w
+    if visual_count > visible then
+        local bottom = math.min(visual_count, (self.vtop or 1) + visible - 1)
+        filled = math.max(1, math.min(w, math.floor(w * bottom / visual_count)))
+    end
+    local parts = { align = "top" }
+    if filled > 0 then
+        parts[#parts+1] = LineWidget:new{
+            background = Blitbuffer.COLOR_BLACK,
+            dimen = Geom:new{ w = filled, h = MDEDIT_PROGRESS_H },
+        }
+    end
+    if filled < w then
+        parts[#parts+1] = LineWidget:new{
+            background = Blitbuffer.Color8(205),
+            dimen = Geom:new{ w = w - filled, h = MDEDIT_PROGRESS_H },
+        }
+    end
+    return HorizontalGroup:new(parts)
 end
 function MDEdit:menuGlyph()
-    -- Hamburger, nudged up ~4px (bottom span) so it optically aligns with the
-    -- smaller title text rather than sitting low against the taller cell.
+    -- Same "appbar.menu" icon KOReader's own title bars use, so this matches
+    -- the hamburger on the file-listing screen instead of a hand-drawn glyph.
     return CenterContainer:new{ dimen = Geom:new{ w = MDEDIT_MENU_W, h = MDEDIT_TOPBAR_H },
-        VerticalGroup:new{ align = "center",
-            TextWidget:new{ text = "\226\152\176", face = Font:getFace("cfont", 30), fgcolor = Blitbuffer.COLOR_BLACK },
-            VerticalSpan:new{ width = 8 },
-        } }
+        IconWidget:new{ icon = "appbar.menu", width = Screen:scaleBySize(24), height = Screen:scaleBySize(24) } }
 end
 function MDEdit:topBar(cw)
     local title_face = Font:getFace("cfont", 22)
@@ -701,7 +826,7 @@ function MDEdit:topBar(cw)
                 TextWidget:new{ text = "Edit", face = edit_face, fgcolor = Blitbuffer.COLOR_BLACK } },
         }
     end
-    local tools = { "H", "B", "I", "\226\128\162", "1.", "\226\152\144", "T" }
+    local tools = { "H", "B", "I", "\226\128\162", "1.", "\226\152\144", "\226\150\164" }
     local divider_w = #tools * MDEDIT_TOOL_DIVIDER
     local min_action_w = ((#tools + 1) * MDEDIT_TOOL_MIN_CELL) + divider_w
     local max_title_w = math.min(MDEDIT_TITLE_W, math.max(80, cw - MDEDIT_MENU_W - min_action_w - MDEDIT_TITLE_ACTION_GAP))
@@ -717,14 +842,15 @@ function MDEdit:topBar(cw)
         TextWidget:new{ text = title, face = title_face, fgcolor = Blitbuffer.Color8(110) } }
     x = x + title_w + gap_w
     local tool_widgets = {}
-    local tool_names = { "header", "bold", "italic", "list", "ordered", "task", "table" }
+    local tool_names = { "header", "bold", "italic", "list", "ordered", "task", "reader" }
     for i, lbl in ipairs(tools) do
         if i > 1 then
             tool_widgets[#tool_widgets+1] = self:toolDivider()
             x = x + MDEDIT_TOOL_DIVIDER
         end
         self.top_zones[tool_names[i]] = { x0 = x, x1 = x + tool_cell_w }
-        tool_widgets[#tool_widgets+1] = self:toolCell(lbl, i == 6 and "cfont" or "tfont", i == 6 and 24 or 23, tool_cell_w)
+        local glyph_tool = i == 6 or i == 7   -- checkbox + reader glyphs render from cfont
+        tool_widgets[#tool_widgets+1] = self:toolCell(lbl, glyph_tool and "cfont" or "tfont", glyph_tool and 24 or 23, tool_cell_w)
         x = x + tool_cell_w
     end
     x = x + MDEDIT_TOOL_DIVIDER
@@ -862,8 +988,17 @@ function MDEdit:layoutLine(toks, availw)
     rows[#rows+1] = row
     return rows
 end
+-- Rendering a row shapes glyphs into TextWidgets, which hold native (malloc'ed)
+-- buffers that only :free() releases promptly -- Lua's GC won't get to them in
+-- time. rebuild() re-renders every visible row on every scroll/cursor-move/caret
+-- blink, so without this cache we'd shape fresh glyphs (and leak the old ones)
+-- many times a second. A row's identity is stable across those redraws (see the
+-- wrap cache in computeVisualRows below); only its own text or a scale change
+-- actually needs a re-render.
 function MDEdit:renderRow(row)
     if #row.segs == 0 then return VerticalSpan:new{ width = 2 } end
+    if row._rendered and row._rendered_scale == self.scale then return row._rendered end
+    if row._rendered then row._rendered:free() end
     local hg = HorizontalGroup:new{ align = "top" }
     if row.indent and row.indent > 0 then hg[#hg+1] = HorizontalSpan:new{ width = row.indent } end
     for _, seg in ipairs(row.segs) do
@@ -874,40 +1009,105 @@ function MDEdit:renderRow(row)
                 face = md_face(seg.style, self.scale), fgcolor = md_color(seg.style) }
         end
     end
+    row._rendered, row._rendered_scale = hg, self.scale
     return hg
 end
+-- Greedy word-wrap of a table cell into lines that each fit `maxw` px. Words
+-- longer than a column are hard-broken on UTF-8 boundaries so nothing is lost.
+function MDEdit:wrapCellText(text, style, maxw)
+    text = tostring(text or "")
+    local face = md_face(style, self.scale)
+    if text == "" then return { "" } end
+    if self:textw(text, face) <= maxw then return { text } end
+    local lines, cur = {}, ""
+    for word in text:gmatch("%S+") do
+        local candidate = cur == "" and word or (cur .. " " .. word)
+        if self:textw(candidate, face) <= maxw then
+            cur = candidate
+        else
+            if cur ~= "" then lines[#lines+1] = cur; cur = "" end
+            if self:textw(word, face) <= maxw then
+                cur = word
+            else
+                local w = word                          -- hard-break an over-long word
+                while w ~= "" do
+                    local i, prefix = 0, ""
+                    while true do
+                        local nxt = utf8_right(w, i)
+                        if nxt == i then break end
+                        if self:textw(w:sub(1, nxt), face) <= maxw then prefix = w:sub(1, nxt); i = nxt
+                        else break end
+                    end
+                    if prefix == "" then prefix = w:sub(1, math.max(1, utf8_right(w, 0))) end
+                    lines[#lines+1] = prefix
+                    w = w:sub(#prefix + 1)
+                end
+            end
+        end
+    end
+    if cur ~= "" then lines[#lines+1] = cur end
+    if #lines == 0 then lines[1] = "" end
+    return lines
+end
 function MDEdit:layoutTable(tbl, availw)
-    local widths = {}
-    for c = 1, tbl.ncols do widths[c] = 0 end
+    local pad_x = math.floor(MDEDIT_TABLE_PAD_X * self.scale)
+    local pad_x2 = 2 * pad_x
+    local minw = math.max(34, math.floor(42 * self.scale))
+    -- Natural single-line width each column would like, so short columns can stay
+    -- compact while long ones absorb the wrapping.
+    local nat = {}
+    for c = 1, tbl.ncols do nat[c] = minw end
     for _, tr in ipairs(tbl.rows) do
+        local style = tr.header and "bold" or "normal"
         for c = 1, tbl.ncols do
             local cell = tr.cells[c]
-            local style = tr.header and "bold" or "normal"
-            widths[c] = math.max(widths[c], self:wordw(cell and cell.text or "", style))
+            nat[c] = math.max(nat[c], self:wordw(cell and cell.text or "", style) + pad_x2)
+        end
+    end
+    local natsum = 0
+    for c = 1, tbl.ncols do natsum = natsum + nat[c] end
+    local widths = {}
+    if natsum <= availw then
+        for c = 1, tbl.ncols do widths[c] = nat[c] end
+    else
+        -- Water-filling: columns narrower than an even share keep their natural
+        -- width; the remaining space is split evenly among the wide columns, which
+        -- then wrap. Repeats until the wide set is stable.
+        local remaining, count, avail = {}, tbl.ncols, availw
+        for c = 1, tbl.ncols do remaining[c] = true end
+        while true do
+            local share = math.floor(avail / math.max(1, count))
+            local changed = false
+            for c = 1, tbl.ncols do
+                if remaining[c] and nat[c] <= share then
+                    widths[c] = nat[c]; remaining[c] = false
+                    avail = avail - nat[c]; count = count - 1; changed = true
+                end
+            end
+            if not changed or count == 0 then break end
+        end
+        if count > 0 then
+            local share = math.max(minw, math.floor(avail / count))
+            for c = 1, tbl.ncols do if remaining[c] then widths[c] = share end end
         end
     end
     local total = 0
-    local minw = math.max(34, math.floor(42 * self.scale))
-    for c = 1, tbl.ncols do
-        widths[c] = math.max(minw, widths[c] + math.floor(2 * MDEDIT_TABLE_PAD_X * self.scale))
-        total = total + widths[c]
-    end
-    if total > availw then
-        local fixed_min = minw * tbl.ncols
-        local stretch = math.max(1, total - fixed_min)
-        local target = math.max(fixed_min, availw)
-        for c = 1, tbl.ncols do
-            widths[c] = minw + math.floor((widths[c] - minw) * (target - fixed_min) / stretch)
-        end
-        total = 0
-        for c = 1, tbl.ncols do total = total + widths[c] end
-    end
+    for c = 1, tbl.ncols do widths[c] = math.max(minw, widths[c]); total = total + widths[c] end
 
+    local pad_y = math.floor(MDEDIT_TABLE_PAD_Y * self.scale)
     local entries = {}
     for ri, tr in ipairs(tbl.rows) do
         local style = tr.header and "bold" or "normal"
-        local texth = self:texth(style)
-        local rowh = math.max(24, texth + math.floor(2 * MDEDIT_TABLE_PAD_Y * self.scale) + 2)
+        local lineh = self:texth(style)
+        local wrapped, maxlines = {}, 1
+        for c = 1, tbl.ncols do
+            local cell = tr.cells[c]
+            local inner = math.max(1, widths[c] - pad_x2 - 2)
+            local wl = self:wrapCellText(cell and cell.text or "", style, inner)
+            wrapped[c] = wl
+            if #wl > maxlines then maxlines = #wl end
+        end
+        local rowh = math.max(24, maxlines * lineh + 2 * pad_y + 2)
         entries[#entries+1] = {
             kind = "table_row",
             line = tr.line,
@@ -919,37 +1119,36 @@ function MDEdit:layoutTable(tbl, availw)
             w = total,
             col_widths = widths,
             aligns = tbl.aligns,
+            wrapped = wrapped,
+            lineh = lineh,
         }
     end
     return entries
 end
-function MDEdit:tableCell(cell, colw, rowh, style, align)
+function MDEdit:tableCell(lines, colw, rowh, style, align)
     local pad_x = math.floor(MDEDIT_TABLE_PAD_X * self.scale)
     local pad_y = math.floor(MDEDIT_TABLE_PAD_Y * self.scale)
     local face = md_face(style, self.scale)
-    local max_text_w = math.max(1, colw - (2 * pad_x) - 2)
-    local display = self:trimToWidth(cell and cell.text or "", max_text_w, face)
-    local tw = self:textw(display, face)
-    local left = pad_x
-    if align == "right" then left = math.max(pad_x, colw - pad_x - tw)
-    elseif align == "center" then left = math.max(pad_x, math.floor((colw - tw) / 2)) end
-    return FrameContainer:new{ bordersize = 1, padding = 0, margin = 0, width = colw, height = rowh,
-        VerticalGroup:new{
-            VerticalSpan:new{ width = pad_y },
-            HorizontalGroup:new{
-                HorizontalSpan:new{ width = left },
-                TextWidget:new{ text = display, face = face, fgcolor = Blitbuffer.COLOR_BLACK },
-            },
-        },
-    }
+    local vg = VerticalGroup:new{ align = "left", VerticalSpan:new{ width = pad_y } }
+    for _, ln in ipairs(lines or { "" }) do
+        local tw = self:textw(ln, face)
+        local left = pad_x
+        if align == "right" then left = math.max(pad_x, colw - pad_x - tw)
+        elseif align == "center" then left = math.max(pad_x, math.floor((colw - tw) / 2)) end
+        vg[#vg+1] = HorizontalGroup:new{
+            HorizontalSpan:new{ width = left },
+            TextWidget:new{ text = ln, face = face, fgcolor = Blitbuffer.COLOR_BLACK },
+        }
+    end
+    return FrameContainer:new{ bordersize = 1, padding = 0, margin = 0, width = colw, height = rowh, vg }
 end
 function MDEdit:renderTableRow(vr)
-    local cells = {}
     local style = vr.header and "bold" or "normal"
+    local hg = HorizontalGroup:new{ align = "top" }
     for c = 1, #vr.col_widths do
-        cells[#cells+1] = self:tableCell(vr.cells[c], vr.col_widths[c], vr.h, style, vr.aligns[c])
+        hg[#hg+1] = self:tableCell(vr.wrapped and vr.wrapped[c], vr.col_widths[c], vr.h, style, vr.aligns[c])
     end
-    return HorizontalGroup:new(cells)
+    return hg
 end
 function MDEdit:tableColAtX(rm, x)
     if x < 0 then
@@ -1077,6 +1276,13 @@ end
 -- expensive step (md_tokenize + font-width measurement per line), so its
 -- result is cached (see :visualRows) and only recomputed when the text or the
 -- available width changes -- never on a plain scroll.
+-- Releases the native TextWidget buffers (see renderRow) cached on a wrap-cache
+-- entry's rows. Call this only for entries that are actually being dropped.
+local function free_wrap_entry(entry)
+    for _, row in ipairs(entry.rows) do
+        if row._rendered then row._rendered:free(); row._rendered = nil end
+    end
+end
 function MDEdit:computeVisualRows(text_w)
     -- Per-logical-line wrap cache keyed by the line's exact text. Editing one
     -- line is a single cache miss (the tokenize + word-wrap for that line);
@@ -1084,6 +1290,7 @@ function MDEdit:computeVisualRows(text_w)
     -- instead of the whole document. The cache is rebuilt from the live lines
     -- each pass, so it can never grow past the current document.
     local prev = (self._wrap_cache_w == text_w) and self._wrap_cache or nil
+    local old_cache = self._wrap_cache
     local cache, out = {}, {}
     local function appendLine(i)
         local text = self.lines[i]
@@ -1121,6 +1328,11 @@ function MDEdit:computeVisualRows(text_w)
             i = i + 1
         end
     end
+    if old_cache then
+        for text, entry in pairs(old_cache) do
+            if cache[text] ~= entry then free_wrap_entry(entry) end
+        end
+    end
     self._wrap_cache, self._wrap_cache_w = cache, text_w
     if #out == 0 then out[1] = { kind = "row", line = 1, row = { segs = {}, w = 0, sb = 0 }, block = "normal", ri = 1 } end
     return out
@@ -1152,7 +1364,7 @@ function MDEdit:cursorVisual(vrows)
     return map[cri], cx
 end
 function MDEdit:textWidth()
-    return self.fw - (MDEDIT_PAD * 2) - MDEDIT_SCROLLBAR_W
+    return self.fw - (MDEDIT_PAD * 2)
 end
 function MDEdit:moveCursorVisual(drow)
     local vrows = self:visualRows(self:textWidth())
@@ -1185,9 +1397,13 @@ function MDEdit:rebuild()
     local text_w = self:textWidth()
     local topbar = self:topBar(cw)
     local vg = VerticalGroup:new{ align = "left", topbar, VerticalSpan:new{ width = MDEDIT_TOPBAR_GAP } }
-    local kbd_h = self.keyboard and math.floor(self.fh * 0.36) or 0
+    local kbd_h = 0
+    if self.keyboard then
+        kbd_h = self.keyboard.dimen and self.keyboard.dimen.h or math.floor(self.fh * 0.36)
+    end
     local editor_top = MDEDIT_PAD + MDEDIT_TOPBAR_H + MDEDIT_TOPBAR_GAP
-    local budget = self.fh - editor_top - MDEDIT_PAD - kbd_h
+    local progress_area = MDEDIT_PROGRESS_GAP + MDEDIT_PROGRESS_H
+    local budget = self.fh - editor_top - MDEDIT_PAD - kbd_h - progress_area
     self.visible_budget = budget
     local body = VerticalGroup:new{ align = "left" }
     local visual_rows = self:visualRows(text_w)
@@ -1274,22 +1490,23 @@ function MDEdit:rebuild()
     end
     self.visible_vrows = math.max(1, shown)   -- visual entries (rows+gaps) on screen
     self.top = self.row_map[1] and self.row_map[1].line or 1
-    local sb = self._show_scrollbar and self:scrollbar(budget)
-    if sb then
-        vg[#vg+1] = OverlapGroup:new{
-            dimen = Geom:new{ w = cw, h = budget },
-            body,
-            RightContainer:new{ dimen = Geom:new{ w = cw, h = budget }, sb },
-        }
-    else
-        vg[#vg+1] = body
-    end
-    self.editor_refresh_region = Geom:new{ x = 0, y = 0, w = self.fw, h = math.max(1, editor_top + budget + MDEDIT_PAD) }
-    self[1] = FrameContainer:new{ background = Blitbuffer.COLOR_WHITE, bordersize = 0, padding = MDEDIT_PAD,
-        width = self.fw, height = self.fh, vg }
+    vg[#vg+1] = body
+    self.editor_refresh_region = Geom:new{
+        x = 0, y = 0, w = self.fw,
+        h = math.max(1, editor_top + budget + progress_area + MDEDIT_PAD),
+    }
+    -- The progress bar is pinned to the very bottom of the screen (below the text
+    -- frame's padding) so it holds a fixed position regardless of how much text is
+    -- on screen, and never crowds the last line.
+    self[1] = OverlapGroup:new{
+        dimen = Geom:new{ x = 0, y = 0, w = self.fw, h = self.fh },
+        FrameContainer:new{ background = Blitbuffer.COLOR_WHITE, bordersize = 0, padding = MDEDIT_PAD,
+            width = self.fw, height = self.fh, vg },
+        BottomContainer:new{ dimen = Geom:new{ w = self.fw, h = self.fh - 3 }, self:progressBar(cw) },
+    }
 end
--- Bounding band (full width) of one logical line's visible rows, for narrow
--- e-ink refreshes while typing.
+-- Bounding bands (full width) of logical-line rows, for narrow e-ink refreshes
+-- while typing.
 function MDEdit:lineBand(row)
     local y0, y1
     for _, rm in ipairs(self.row_map or {}) do
@@ -1300,6 +1517,64 @@ function MDEdit:lineBand(row)
     end
     if not y0 then return nil end
     return Geom:new{ x = 0, y = math.max(0, y0 - 2), w = self.fw, h = (y1 - y0) + 4 }
+end
+function MDEdit:lineTailBand(row, col)
+    local y0, y1
+    for _, rm in ipairs(self.row_map or {}) do
+        if rm.line == row then
+            local include = true
+            if rm.row then
+                local rb = rm.row.sb or 0
+                for _, sg in ipairs(rm.row.segs or {}) do rb = rb + #(sg.text or "") end
+                include = col == nil or col <= rb
+            end
+            if include then
+                y0 = math.min(y0 or rm.y0, rm.y0)
+                y1 = math.max(y1 or rm.y1, rm.y1)
+            end
+        end
+    end
+    if not y0 then return self:lineBand(row) end
+    return Geom:new{ x = 0, y = math.max(0, y0 - 2), w = self.fw, h = (y1 - y0) + 4 }
+end
+function MDEdit:lineTailRegions(row_map, row, col)
+    local regions, first = {}, true
+    for _, rm in ipairs(row_map or {}) do
+        if rm.line == row and rm.row then
+            local rb = rm.row.sb or 0
+            for _, sg in ipairs(rm.row.segs or {}) do rb = rb + #(sg.text or "") end
+            if col == nil or col <= rb then
+                local x = 0
+                if first then
+                    x = math.max(0, MDEDIT_PAD + self:rowXAt(rm.row, math.max(col or 0, rm.row.sb or 0)) - 2)
+                    first = false
+                end
+                regions[#regions+1] = Geom:new{
+                    x = x,
+                    y = math.max(0, rm.y0 - 2),
+                    w = math.max(1, self.fw - x),
+                    h = (rm.y1 - rm.y0) + 4,
+                }
+            end
+        end
+    end
+    return #regions > 0 and regions or nil
+end
+function MDEdit:addRegions(dst, src)
+    if not src then return dst end
+    dst = dst or {}
+    for _, region in ipairs(src) do dst[#dst+1] = region end
+    return dst
+end
+-- The slice from the top of a logical line down to the bottom of the editor.
+-- After a reflow (wrap/newline/join) or a line-height change, only this line and
+-- everything below it moved; the top bar and lines above are untouched, so this
+-- avoids repainting (and flashing) the whole page.
+function MDEdit:regionFromLineToBottom(row)
+    local band = self:lineBand(row)
+    if not band then return nil end
+    local bottom = self.editor_refresh_region.y + self.editor_refresh_region.h
+    return Geom:new{ x = 0, y = band.y, w = self.fw, h = math.max(1, bottom - band.y) }
 end
 function MDEdit:unionRegion(a, b)
     if not a then return b end
@@ -1323,56 +1598,174 @@ function MDEdit:refresh(opts)
     local prev_count = self.visual_count
     local prev_vtop = self.vtop
     local prev_crow = self._render_crow or self.crow
+    local prev_ccol = self._render_ccol or self.ccol
     local prev_band = self:lineBand(self.crow)
+    local prev_caret = self.caret_region
+    local prev_row_map = self.row_map
     local prev_sel_multiline = self._render_sel_multiline
     self:rebuild()
     local region = self.keyboard and self.editor_refresh_region or nil
+    local regions
     local vtop_changed = prev_vtop and self.vtop and prev_vtop ~= self.vtop
     local selection_dirty = opts.selection or prev_sel_multiline or self:selectionIsMultiline()
     local band = self:lineBand(self.crow)
     local line_geometry_changed = prev_band and band
         and (prev_band.y ~= band.y or prev_band.h ~= band.h)
-    -- If the wrapped-row count is unchanged, the edit stayed within one line and
-    -- nothing below it moved -- refresh just that line's band. Much faster and
-    -- less flashy on e-ink than repainting the whole editor every keystroke.
-    -- Any reflow (wrap change, newline, line join) changes the count and falls
-    -- back to the full region.
+    -- If the wrapped-row count is unchanged, the edit stayed within one logical
+    -- line and nothing below it moved -- refresh only the affected tail of that
+    -- line. A reflow (wrap change, newline, line join) or a line-height change
+    -- shifts the edited line and everything below it, but leaves the top bar and
+    -- the lines above untouched -- repaint only that lower slice.
+    -- With the on-screen keyboard visible, keep refreshing the whole editor band;
+    -- partial editor redraws above a live keyboard leave mixed e-ink regions.
+    local reflow = prev_count and self.visual_count ~= prev_count
     if opts.full then
         region = self.editor_refresh_region
-    elseif selection_dirty or vtop_changed or line_geometry_changed then
+    elseif selection_dirty or vtop_changed then
         region = self.editor_refresh_region
+    elseif reflow or line_geometry_changed then
+        if self.keyboard then
+            region = self.editor_refresh_region
+        else
+            region = self:regionFromLineToBottom(math.min(prev_crow or self.crow, self.crow))
+                or self.editor_refresh_region
+        end
     elseif prev_count and self.visual_count == prev_count then
-        if prev_crow and prev_crow ~= self.crow then band = self:unionRegion(self:lineBand(prev_crow), band) end
+        if opts.cursor_move then
+            if prev_caret and self.caret_region then
+                regions = { prev_caret, self.caret_region }
+                band = nil
+            elseif prev_caret or self.caret_region then
+                band = prev_caret or self.caret_region
+            elseif prev_crow and prev_crow ~= self.crow then
+                band = self:unionRegion(self:lineBand(prev_crow), band)
+            end
+        elseif opts.precise_edit then
+            regions = self:addRegions(regions, self:lineTailRegions(prev_row_map, prev_crow, prev_ccol))
+            regions = self:addRegions(regions, self:lineTailRegions(self.row_map, self.crow, self.ccol))
+            if regions then
+                band = nil
+            else
+                band = self:lineTailBand(self.crow, self.ccol)
+            end
+        else
+            band = self:lineTailBand(self.crow, self.ccol)
+            if prev_crow and prev_crow ~= self.crow then
+                band = self:unionRegion(self:lineTailBand(prev_crow, prev_ccol), band)
+            elseif prev_ccol and prev_ccol ~= self.ccol then
+                band = self:unionRegion(self:lineTailBand(self.crow, prev_ccol), band)
+            end
+        end
         if band then region = band end
     end
     self._render_crow = self.crow
+    self._render_ccol = self.ccol
     self._render_sel_multiline = self:selectionIsMultiline()
     self._last_dirty_at = now_seconds()
-    self._last_dirty_region = region
-    self._last_dirty_full = region == nil
-    UIManager:setDirty(self, "ui", region)
+    self._last_dirty_region = regions and self.caret_region or region
+    self._last_dirty_full = not regions and region == nil
+    if regions then
+        for _, dirty_region in ipairs(regions) do
+            UIManager:setDirty(self, "ui", dirty_region)
+        end
+    else
+        UIManager:setDirty(self, "ui", region)
+    end
 end
 -- Scroll-only repaint: vtop moved but the text is unchanged, so reuse the
 -- cached visual rows instead of re-tokenizing the whole document.
 function MDEdit:refreshScroll()
     self.caret_on = true
     self:rebuild()
-    UIManager:setDirty(self, "ui", self.keyboard and self.editor_refresh_region or nil)
+    UIManager:setDirty(self, "ui", self.editor_refresh_region)
 end
 function MDEdit:scheduleAutosave()
     self._dirty = true
+    if self._autosave_paused_for_external then return end
     if self._autosave_pending then UIManager:unschedule(self._autosave_pending); self._autosave_pending = nil end
     local fn
     fn = function()
         if self._autosave_pending == fn then self._autosave_pending = nil end
-        if self._dirty then self:save() end
+        if self._dirty and not self._autosave_paused_for_external then self:save() end
     end
     self._autosave_pending = fn
     UIManager:scheduleIn(MDEDIT_AUTOSAVE_DELAY, fn)
 end
 function MDEdit:flushAutosave()
     if self._autosave_pending then UIManager:unschedule(self._autosave_pending); self._autosave_pending = nil end
+    if self._autosave_paused_for_external then return end
     if self._dirty then self:save() end
+end
+function MDEdit:currentText()
+    return table.concat(self.lines, "\n")
+end
+function MDEdit:reloadFromDisk(text, sig)
+    if text == nil then text = read_file(self.path) end
+    if text == nil then return false end
+    self.lines = split_text_lines(text)
+    self.crow = math.max(1, math.min(self.crow or 1, #self.lines))
+    self.ccol = math.max(0, math.min(self.ccol or 0, #(self.lines[self.crow] or "")))
+    self.sel = nil
+    self._desired_x = nil
+    self._burst = nil
+    self._undo, self._redo = {}, {}
+    self._dirty = false
+    self._file_text = text
+    self._file_signature = sig or file_signature(self.path)
+    self._external_change_prompted = nil
+    self._autosave_paused_for_external = nil
+    if self._autosave_pending then UIManager:unschedule(self._autosave_pending); self._autosave_pending = nil end
+    self:refresh{ layout_dirty = true, full = true }
+    notify(_("Reloaded from disk"))
+    return true
+end
+function MDEdit:promptExternalReload(text, sig)
+    if self._external_change_prompted then return end
+    self._external_change_prompted = true
+    self._autosave_paused_for_external = true
+    if self._autosave_pending then UIManager:unschedule(self._autosave_pending); self._autosave_pending = nil end
+    UIManager:show(ConfirmBox:new{
+        text = _("File changed on disk. Reload and discard unsaved edits?\nAutosave is paused until you reload or save."),
+        ok_text = _("Reload"),
+        ok_callback = function() self:reloadFromDisk(text, sig) end,
+    })
+end
+function MDEdit:checkExternalFile()
+    local sig = file_signature(self.path)
+    if same_file_signature(sig, self._file_signature) then return end
+    local text = read_file(self.path)
+    if text == nil then
+        if not self._external_missing_notified then
+            self._external_missing_notified = true
+            notify(_("File is unavailable on disk"))
+        end
+        return
+    end
+    self._external_missing_notified = nil
+    if text == self:currentText() then
+        self._file_text = text
+        self._file_signature = sig
+        self._dirty = false
+        self._autosave_paused_for_external = nil
+        return
+    end
+    if self._dirty then
+        self:promptExternalReload(text, sig)
+    else
+        self:reloadFromDisk(text, sig)
+    end
+end
+function MDEdit:scheduleFilePoll()
+    if self._file_poll_pending then UIManager:unschedule(self._file_poll_pending); self._file_poll_pending = nil end
+    local fn
+    fn = function()
+        if self._file_poll_pending == fn then self._file_poll_pending = nil end
+        if self._closing then return end
+        self:checkExternalFile()
+        self:scheduleFilePoll()
+    end
+    self._file_poll_pending = fn
+    UIManager:scheduleIn(MDEDIT_FILE_RELOAD_INTERVAL, fn)
 end
 function MDEdit:snapshot()
     self:scheduleAutosave()
@@ -1488,18 +1881,19 @@ function MDEdit:rowXAt(row, p)        -- x of absolute byte col p within a visua
     end
     return x
 end
-function MDEdit:arrow(drow, dcol, m)  -- arrow key with optional Shift (select) / Alt (word)
+function MDEdit:arrow(drow, dcol, m)  -- arrow key with optional Shift (select) / Alt-or-Command (word)
     local selecting = keymod(m, "Shift")
     if selecting then if not self.sel then self.sel = { row = self.crow, col = self.ccol } end
     else self.sel = nil end
-    if keymod(m, "Alt") and dcol ~= 0 then if dcol < 0 then self:wordLeft(selecting) else self:wordRight(selecting) end
+    if word_key_mod(m) and dcol ~= 0 then if dcol < 0 then self:wordLeft(selecting) else self:wordRight(selecting) end
     else self:moveCursor(drow, dcol, { selection = selecting }) end
 end
 local md_split_line_prefix
 function MDEdit:addChars(s)
     if s == "\n" then return self:newline() end
     self._desired_x = nil
-    if self:hasSel() then self:snapshot(); self._burst = nil; self:deleteSelection() else self:edit("type") end
+    local had_sel = self:hasSel()
+    if had_sel then self:snapshot(); self._burst = nil; self:deleteSelection() else self:edit("type") end
     local l = self.lines[self.crow]
     if s == " " and self.ccol >= 1 and l:sub(self.ccol, self.ccol) == " "
        and (self.ccol < 2 or l:sub(self.ccol-1, self.ccol-1) ~= " ") then  -- double space -> ". "
@@ -1509,7 +1903,7 @@ function MDEdit:addChars(s)
     end
     self.lines[self.crow] = l:sub(1, self.ccol) .. s .. l:sub(self.ccol+1)
     self.ccol = self.ccol + #s
-    self:refresh()
+    self:refresh{ precise_edit = not had_sel }
 end
 function MDEdit:newline()
     self:snapshot(); self._burst = nil
@@ -1549,6 +1943,7 @@ function MDEdit:delChar()
         local prev = utf8_left(l, self.ccol)          -- delete the whole UTF-8 char to the left
         self.lines[self.crow] = l:sub(1, prev) .. l:sub(self.ccol+1)
         self.ccol = prev
+        return self:refresh{ precise_edit = true }
     elseif self.crow > 1 then
         local prev = self.lines[self.crow-1]
         self.ccol = #prev
@@ -1577,6 +1972,7 @@ function MDEdit:moveCursor(drow, dcol, opts)
     end
     opts = opts or {}
     opts.layout_dirty = false
+    opts.cursor_move = true
     self:refresh(opts)
 end
 -- VirtualKeyboard inputbox interface
@@ -1584,8 +1980,8 @@ function MDEdit:leftChar()  self.sel = nil; self:moveCursor(0, -1) end
 function MDEdit:rightChar() self.sel = nil; self:moveCursor(0, 1) end
 function MDEdit:upLine()    self.sel = nil; self:moveCursor(-1, 0) end
 function MDEdit:downLine()  self.sel = nil; self:moveCursor(1, 0) end
-function MDEdit:goToStartOfLine() self._desired_x = nil; self.ccol = 0; self:refresh{ layout_dirty = false } end
-function MDEdit:goToEndOfLine()   self._desired_x = nil; self.ccol = #self.lines[self.crow]; self:refresh{ layout_dirty = false } end
+function MDEdit:goToStartOfLine() self._desired_x = nil; self.ccol = 0; self:refresh{ layout_dirty = false, cursor_move = true } end
+function MDEdit:goToEndOfLine()   self._desired_x = nil; self.ccol = #self.lines[self.crow]; self:refresh{ layout_dirty = false, cursor_move = true } end
 function MDEdit:delToStartOfLine()
     self:snapshot(); self._burst = nil
     self._desired_x = nil
@@ -1594,32 +1990,24 @@ end
 function MDEdit:delWord()
     self._desired_x = nil
     if self:hasSel() then self:snapshot(); self._burst = nil; self:deleteSelection(); return self:refresh() end
+    -- At the start of a line there is no word to delete on this line; fall back to
+    -- delChar so a word-delete still joins with the previous line (matches every
+    -- editor, and is the path the Bluetooth keyboard's backspace takes).
+    if self.ccol <= 0 then return self:delChar() end
     self:snapshot(); self._burst = nil
     local l = self.lines[self.crow]
     local before = l:sub(1, prev_word_col(l, self.ccol))
-    self.lines[self.crow] = before .. l:sub(self.ccol+1); self.ccol = #before; self:refresh()
+    self.lines[self.crow] = before .. l:sub(self.ccol+1); self.ccol = #before; self:refresh{ precise_edit = true }
 end
 function MDEdit:wordLeft(selecting)
     self._burst = nil
     self._desired_x = nil
-    self.ccol = prev_word_col(self.lines[self.crow], self.ccol); self:refresh{ layout_dirty = false, selection = selecting }
+    self.ccol = prev_word_col(self.lines[self.crow], self.ccol); self:refresh{ layout_dirty = false, selection = selecting, cursor_move = true }
 end
 function MDEdit:wordRight(selecting)
     self._burst = nil
     self._desired_x = nil
-    self.ccol = next_word_col(self.lines[self.crow], self.ccol); self:refresh{ layout_dirty = false, selection = selecting }
-end
-function MDEdit:flashScrollbar()
-    self._show_scrollbar = true
-    local token = {}
-    self._scrollbar_token = token
-    UIManager:scheduleIn(1.1, function()
-        if self._scrollbar_token == token and self._caret_blinking then
-            self._show_scrollbar = false
-            self:rebuild()
-            UIManager:setDirty(self, "ui")
-        end
-    end)
+    self.ccol = next_word_col(self.lines[self.crow], self.ccol); self:refresh{ layout_dirty = false, selection = selecting, cursor_move = true }
 end
 function MDEdit:scrollBy(lines)
     local old = self.vtop or 1
@@ -1627,7 +2015,6 @@ function MDEdit:scrollBy(lines)
     self.vtop = math.max(1, math.min(max_top, old + lines))
     if self.vtop ~= old then
         self._manual_scroll_cursor = { row = self.crow, col = self.ccol }
-        self:flashScrollbar()
     end
     self:refreshScroll()
 end
@@ -1679,12 +2066,29 @@ function MDEdit:showKeyboard()
     if self.reader_mode then return end
     if self.keyboard then return end
     local VirtualKeyboard = require("ui/widget/virtualkeyboard")
-    self.keyboard = VirtualKeyboard:new{ inputbox = self }
+    local keyboard = VirtualKeyboard:new{ inputbox = self }
+    keyboard.modal = false
+    self.keyboard = keyboard
+    local editor = self
+    local original_close = keyboard.onCloseWidget
+    function keyboard:onCloseWidget()
+        if original_close then original_close(self) end
+        if editor.keyboard == self then
+            editor.keyboard = nil
+            if editor._caret_blinking then
+                editor:refresh{ layout_dirty = false, full = true }
+            end
+        end
+    end
     self:refresh{ layout_dirty = false, full = true }
-    UIManager:show(self.keyboard)
+    UIManager:show(keyboard)
 end
 function MDEdit:hideKeyboard()
-    if self.keyboard then UIManager:close(self.keyboard); self.keyboard = nil; self:refresh{ layout_dirty = false, full = true } end
+    if not self.keyboard then return end
+    local keyboard = self.keyboard
+    self.keyboard = nil
+    UIManager:close(keyboard)
+    self:refresh{ layout_dirty = false, full = true }
 end
 function MDEdit:isKeyboardRevealGesture(ges)
     if self.reader_mode or self.keyboard then return false end
@@ -1700,35 +2104,78 @@ function MDEdit:isKeyboardRevealGesture(ges)
     return center and from_bottom and upward
 end
 function MDEdit:save()
+    local text = self:currentText()
     local out = io.open(self.path, "w")
     if out then
-        out:write(table.concat(self.lines, "\n"))
+        out:write(text)
         out:close()
         self._dirty = false
+        self._file_text = text
+        self._file_signature = file_signature(self.path)
+        self._external_change_prompted = nil
+        self._autosave_paused_for_external = nil
         if self._autosave_pending then UIManager:unschedule(self._autosave_pending); self._autosave_pending = nil end
         return true
     end
     return false
 end
+-- Handles both the app's own Rotate screen action and any generic resize;
+-- rotate_screen_ccw() has already applied Screen:setRotationMode by the time
+-- this runs, so this only needs to reflow the editor at the new dimensions.
+function MDEdit:onScreenResize()
+    self.fw, self.fh = Screen:getWidth(), Screen:getHeight()
+    self.dimen = Geom:new{ x = 0, y = 0, w = self.fw, h = self.fh }
+    if self.ges_events then
+        for _, ev in pairs(self.ges_events) do
+            for _, range in ipairs(ev) do range.range = self.dimen end
+        end
+    end
+    self._wcache, self._hcache = {}, {}
+    if self._wrap_cache then
+        for _, entry in pairs(self._wrap_cache) do free_wrap_entry(entry) end
+    end
+    self._wrap_cache = nil
+    self:refresh{ layout_dirty = true, full = true }
+    return true
+end
+function MDEdit:onResume()
+    self:checkExternalFile()
+    self.caret_on = true
+    self:refresh{ layout_dirty = false, full = true }
+    schedule_wake_repaint()
+end
 function MDEdit:saveAndClose()
     self:save()
-    if self.keyboard then UIManager:close(self.keyboard); self.keyboard = nil end
+    local keyboard = self.keyboard
+    self.keyboard = nil
+    if keyboard then UIManager:close(keyboard) end
     UIManager:close(self)
     if self.on_close then self.on_close() end
 end
 function MDEdit:saveAndOpenMarkdown()
     self:save()
-    if self.keyboard then UIManager:close(self.keyboard); self.keyboard = nil end
+    local keyboard = self.keyboard
+    self.keyboard = nil
+    if keyboard then UIManager:close(keyboard) end
     UIManager:close(self)
     if open_markdown_picker then open_markdown_picker(path_parent(self.path)) end
 end
 function MDEdit:onCloseWidget()
+    self._closing = true
     self:flushAutosave()
     self._caret_blinking = false
+    if self._file_poll_pending then UIManager:unschedule(self._file_poll_pending); self._file_poll_pending = nil end
     if self._page_pending then UIManager:unschedule(self._page_pending); self._page_pending = nil end
     if self._pan_reset then UIManager:unschedule(self._pan_reset); self._pan_reset = nil end
     if Device.input and self._old_disable_double_tap ~= nil then
         Device.input.disable_double_tap = self._old_disable_double_tap
+    end
+    -- Free every cached row's native TextWidget buffers, not just the ones
+    -- currently on screen (UIManager's own close-time free only reaches the
+    -- visible tree); off-screen rows are only reachable through this cache.
+    if self._wrap_cache then
+        for _, entry in pairs(self._wrap_cache) do free_wrap_entry(entry) end
+        self._wrap_cache = nil
     end
 end
 function MDEdit:onKeyPress(key)
@@ -1743,7 +2190,7 @@ function MDEdit:onKeyPress(key)
         return true
     end
     local lname = name:lower()
-    local m = key.modifiers or {}
+    local m = key_mods(key)
     if shortcut_mod(m) and #name == 1 then
         if lname == "z" then if keymod(m, "Shift") then self:redo() else self:undo() end; return true
         elseif lname == "y" then self:redo(); return true
@@ -1753,8 +2200,10 @@ function MDEdit:onKeyPress(key)
         elseif lname == "a" then self:selectAll(); return true end
     end
     if name == "Backspace" or name == "BackSpace" or name == "Del" or name == "Delete" then
-        if keymod(m, "Alt") then self:delWord() else self:delChar() end
+        if word_key_mod(m) then self:delWord() else self:delChar() end
     elseif name == "Press" or name == "Return" or name == "Enter" or name == "KP_Enter" then self:newline()
+    elseif fn_key_mod(m) and up_key(name) then self.sel = nil; self:pageUp()
+    elseif fn_key_mod(m) and down_key(name) then self.sel = nil; self:pageDown()
     elseif left_key(name)  then self:arrow(0, -1, m)
     elseif right_key(name) then self:arrow(0, 1, m)
     elseif up_key(name)    then self:arrow(-1, 0, m)
@@ -1765,6 +2214,7 @@ function MDEdit:onKeyPress(key)
     elseif name == "Tab" then self:addChars("  ")
     elseif name == "Home" then self:goToStartOfLine()
     elseif name == "End" then self:goToEndOfLine()
+    elseif KEYPAD_CHAR[name] then self:addChars(KEYPAD_CHAR[name])
     elseif #name == 1 then
         if keymod(m, "Alt") then return true end
         local ch = lname
@@ -1804,6 +2254,9 @@ function MDEdit:bumpScale(d)
     MINFOLIO_STATE.scale = self.scale
     save_minfolio_state()
     self._wcache = {}; self._hcache = {}
+    if self._wrap_cache then
+        for _, entry in pairs(self._wrap_cache) do free_wrap_entry(entry) end
+    end
     self._wrap_cache = nil          -- scale changes wrapping/heights; drop the per-line cache
     self:refresh()
 end
@@ -1915,6 +2368,7 @@ function MDEdit:runTopAction(name)
     elseif name == "list" then self:fmtList()
     elseif name == "ordered" then self:fmtOrdered()
     elseif name == "task" then self:fmtTask()
+    elseif name == "reader" then self:setReaderMode(true)
     elseif name == "table" then self:insertTable()
     elseif name == "smaller" then self:bumpScale(-0.1)
     elseif name == "larger" then self:bumpScale(0.1)
@@ -1925,6 +2379,7 @@ function MDEdit:openControls()
     if self.reader_mode then
         show_controls({
             { text = "Exit reader mode", callback = function() self:setReaderMode(false) end },
+            { text = "⟲ Rotate screen", callback = function() rotate_screen_ccw() end },
             { text = "Save & close note", callback = function() self:saveAndClose() end },
         })
         return
@@ -1953,6 +2408,7 @@ function MDEdit:openControls()
         { text = "Paste", callback = function() self:paste() end },
         { text = "Undo",  callback = function() self:undo() end },
         { text = "Redo",  callback = function() self:redo() end },
+        { text = "⟲ Rotate screen", callback = function() rotate_screen_ccw() end },
         { text = "Open .md file...", callback = function() self:saveAndOpenMarkdown() end },
         { text = "Save & close note", callback = function() self:saveAndClose() end },
     })
@@ -2019,16 +2475,17 @@ function MDEdit:onTap(_, ges)
     if self._last_tap and now - self._last_tap.t < MDEDIT_EDIT_DTAP
         and math.abs(p.x - self._last_tap.x) < MDEDIT_EDIT_DTAP_MOVE
         and math.abs(p.y - self._last_tap.y) < MDEDIT_EDIT_DTAP_MOVE
-        and tap_row == self._last_tap.row then
+        and tap_row == self._last_tap.row
+        and tap_col == self._last_tap.col then
         self._last_tap = nil
         self:selectWordAt(p)
         return true
     end
-    self._last_tap = { t = now, x = p.x, y = p.y, row = tap_row }
+    self._last_tap = { t = now, x = p.x, y = p.y, row = tap_row, col = tap_col }
     self.crow, self.ccol = tap_row, tap_col
     self._desired_x = nil
     self._manual_scroll_cursor = { row = self.crow, col = self.ccol }
-    self.sel = nil; self:refresh{ layout_dirty = false }
+    self.sel = nil; self:refresh{ layout_dirty = false, cursor_move = true }
     return true
 end
 function MDEdit:onDoubleTap(_, ges)
@@ -2134,18 +2591,66 @@ local function edit_note(path)
     UIManager:show(MDEdit:new{ path = path }, "full")   -- "full" forces a complete repaint over the menu
 end
 
-local function list_notes()
-    local out = {}
-    if lfs.attributes(NOTES_DIR, "mode") == "directory" then
-        for f in lfs.dir(NOTES_DIR) do
-            if f ~= "." and f ~= ".." and lfs.attributes(NOTES_DIR.."/"..f, "mode") == "file"
-                and f:lower():match("%.md$") then
-                out[#out+1] = f
-            end
+-- Rotates the whole device screen 90° counter-clockwise (repeat to cycle through
+-- upright / sideways / upside-down / sideways-the-other-way, same 4 modes KOReader
+-- itself uses for its own rotation).
+rotate_screen_ccw = function()
+    local mode = Screen:getRotationMode()
+    Screen:setRotationMode((mode - 1) % 4)
+    -- Every full-screen widget we show (the file listing, the editor, any
+    -- popout) is sized from Screen:getWidth()/getHeight() at construction
+    -- time, so it goes stale the instant the physical rotation flips those --
+    -- reads as a frozen/undersized screen. Broadcasting ScreenResize reaches
+    -- every widget in the stack (including ones sitting hidden underneath
+    -- another, e.g. the file list behind an open note), not just the one on
+    -- top, so nothing is left showing a layout built for the old dimensions.
+    UIManager:broadcastEvent(Event:new("ScreenResize"))
+end
+
+local function clean_entry_name(name, add_md_ext)
+    name = tostring(name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" or name == "." or name == ".." or name:find("/", 1, true) or name:find("%z") then
+        return nil
+    end
+    if add_md_ext and not name:match("%.%w+$") then name = name .. ".md" end
+    return name
+end
+
+local function ensure_dir(path)
+    if lfs.attributes(path, "mode") == "directory" then return true end
+    return lfs.mkdir(path)
+end
+
+local function remove_tree(path)
+    local mode = lfs.attributes(path, "mode")
+    if mode == "file" then return os.remove(path) end
+    if mode ~= "directory" then return false end
+    for name in lfs.dir(path) do
+        if name ~= "." and name ~= ".." then
+            if not remove_tree(path_join(path, name)) then return false end
         end
     end
-    table.sort(out)
-    return out
+    return lfs.rmdir(path)
+end
+
+local function dir_entries(dir)
+    local dirs, files = {}, {}
+    local ok = pcall(function()
+        for name in lfs.dir(dir) do
+            if name ~= "." and name ~= ".." and not name:match("^%.") then
+                local path = path_join(dir, name)
+                local mode = lfs.attributes(path, "mode")
+                if mode == "directory" then
+                    dirs[#dirs+1] = name
+                elseif mode == "file" then
+                    files[#files+1] = name
+                end
+            end
+        end
+    end)
+    table.sort(dirs)
+    table.sort(files)
+    return dirs, files, ok
 end
 
 open_markdown_picker = function(start_dir)
@@ -2153,18 +2658,11 @@ open_markdown_picker = function(start_dir)
     if lfs.attributes(dir, "mode") ~= "directory" then dir = NOTES_DIR end
     if lfs.attributes(dir, "mode") ~= "directory" then dir = "/mnt/us" end
 
-    local dirs, files = {}, {}
-    local ok = pcall(function()
-        for name in lfs.dir(dir) do
-            if name ~= "." and name ~= ".." and not name:match("^%.") then
-                local path = path_join(dir, name)
-                local mode = lfs.attributes(path, "mode")
-                if mode == "directory" then dirs[#dirs+1] = name
-                elseif mode == "file" and is_markdown_file(name) then files[#files+1] = name end
-            end
-        end
-    end)
-    table.sort(dirs); table.sort(files)
+    local dirs, all_files, ok = dir_entries(dir)
+    local files = {}
+    for _, name in ipairs(all_files) do
+        if is_markdown_file(name) then files[#files+1] = name end
+    end
 
     local items = {}
     if dir ~= "/" then items[#items+1] = { text = "../", kind = "dir", path = path_parent(dir) } end
@@ -2186,8 +2684,6 @@ open_markdown_picker = function(start_dir)
         title = _("Open .md") .. " - " .. (path_base(dir) ~= "" and dir or "/"),
         item_table = items,
         is_popout = false,
-        width = Screen:getWidth(),
-        height = Screen:getHeight(),
         onMenuSelect = function(_self, item)
             if item.kind == "dir" then
                 UIManager:close(menu)
@@ -2201,51 +2697,176 @@ open_markdown_picker = function(start_dir)
     UIManager:show(menu)
 end
 
-local function open_notes()
-    fl_restore_if_needed()
-    if not lfs.attributes(NOTES_DIR, "mode") then lfs.mkdir(NOTES_DIR) end
-    local items = {
-        { text = "＋ " .. _("New note"), is_new = true },
-        { text = _("Open .md file..."), is_open = true },
-    }
-    for _, f in ipairs(list_notes()) do items[#items+1] = { text = f, fname = f } end
-    logger.info("minfolio open_notes: showing", #items, "items")
-    local menu
-    menu = Menu:new{
-        title = _("Minfolio"),
-        item_table = items,
-        is_popout = false,
-        width = Screen:getWidth(),
-        height = Screen:getHeight(),
-        onMenuSelect = function(_self, item)
-            -- keep this list open underneath; the editor closes back to it (not the file manager)
-            if item.is_new then new_note()
-            elseif item.is_open then open_markdown_picker(NOTES_DIR)
-            elseif item.fname then edit_note(NOTES_DIR.."/"..item.fname) end
-        end,
-    }
-    UIManager:show(menu)
+local show_file_manager
+
+local function refresh_file_manager(menu, dir)
+    if menu then UIManager:close(menu) end
+    show_file_manager(dir)
 end
 
-new_note = function()
+local function show_new_entry_dialog(menu, dir, kind)
+    local is_folder = kind == "folder"
     local dlg
     dlg = InputDialog:new{
-        title = _("New note — name"),
+        title = is_folder and _("New folder") or _("New note"),
         input = "",
         buttons = {{
             { text = _("Cancel"), callback = function() UIManager:close(dlg) end },
             { text = _("Create"), is_enter_default = true, callback = function()
-                local name = (dlg:getInputText() or ""):gsub("^%s+", ""):gsub("%s+$", "")
+                local name = clean_entry_name(dlg:getInputText(), not is_folder)
                 UIManager:close(dlg)
-                if name ~= "" then
-                    if not name:match("%.%w+$") then name = name .. ".md" end
-                    edit_note(NOTES_DIR.."/"..name)
+                if not name then notify(_("Invalid name")); return end
+                local path = path_join(dir, name)
+                if lfs.attributes(path, "mode") then notify(_("Name already exists")); return end
+                if is_folder then
+                    if ensure_dir(path) then
+                        refresh_file_manager(menu, dir)
+                    else
+                        notify(_("Could not create folder"))
+                    end
+                else
+                    if write_file(path, "") then
+                        refresh_file_manager(menu, dir)
+                        edit_note(path)
+                    else
+                        notify(_("Could not create note"))
+                    end
                 end
             end },
         }},
     }
     UIManager:show(dlg)
     dlg:onShowKeyboard()
+end
+
+local function show_rename_dialog(parent_menu, dir, item)
+    local dlg
+    dlg = InputDialog:new{
+        title = _("Rename"),
+        input = item.name,
+        buttons = {{
+            { text = _("Cancel"), callback = function() UIManager:close(dlg) end },
+            { text = _("Rename"), is_enter_default = true, callback = function()
+                local name = clean_entry_name(dlg:getInputText(), item.kind == "file" and is_markdown_file(item.name))
+                UIManager:close(dlg)
+                if not name then notify(_("Invalid name")); return end
+                if name == item.name then return end
+                local dest = path_join(dir, name)
+                if lfs.attributes(dest, "mode") then notify(_("Name already exists")); return end
+                if os.rename(item.path, dest) then
+                    refresh_file_manager(parent_menu, dir)
+                else
+                    notify(_("Could not rename"))
+                end
+            end },
+        }},
+    }
+    UIManager:show(dlg)
+    dlg:onShowKeyboard()
+end
+
+local function confirm_delete(parent_menu, dir, item)
+    UIManager:show(ConfirmBox:new{
+        text = string.format(_("Delete %s?"), item.name),
+        ok_text = _("Delete"),
+        ok_callback = function()
+            if remove_tree(item.path) then
+                refresh_file_manager(parent_menu, dir)
+            else
+                notify(_("Could not delete"))
+            end
+        end,
+    })
+end
+
+local function show_item_actions(parent_menu, dir, item)
+    local actions = {}
+    if item.kind == "dir" then
+        actions[#actions+1] = { text = _("Open folder"), callback = function()
+            refresh_file_manager(parent_menu, item.path)
+        end }
+    elseif is_markdown_file(item.name) then
+        actions[#actions+1] = { text = _("Open"), callback = function()
+            edit_note(item.path)
+        end }
+    end
+    actions[#actions+1] = { text = _("Rename"), callback = function() show_rename_dialog(parent_menu, dir, item) end }
+    actions[#actions+1] = { text = _("Delete"), callback = function() confirm_delete(parent_menu, dir, item) end }
+
+    local menu
+    menu = Menu:new{
+        title = item.name,
+        item_table = actions,
+        is_popout = false,
+        onMenuSelect = function(_self, action)
+            UIManager:close(menu)
+            if action.callback then UIManager:scheduleIn(0.01, action.callback) end
+        end,
+    }
+    UIManager:show(menu)
+end
+
+show_file_manager = function(start_dir)
+    fl_restore_if_needed()
+    ensure_dir(NOTES_DIR)
+    local dir = start_dir or NOTES_DIR
+    if lfs.attributes(dir, "mode") ~= "directory" then dir = NOTES_DIR end
+
+    local dirs, files, ok = dir_entries(dir)
+    local menu
+    local items = {
+        { text = "＋ " .. _("New note"), kind = "new_note" },
+        { text = "＋ " .. _("New folder"), kind = "new_folder" },
+        { text = _("Open .md file..."), is_open = true },
+    }
+    if dir ~= NOTES_DIR then items[#items+1] = { text = "../", kind = "dir_nav", path = path_parent(dir) } end
+    for _, name in ipairs(dirs) do
+        local item = { text = name .. "/", kind = "dir", name = name, path = path_join(dir, name) }
+        item.hold_callback = function() show_item_actions(menu, dir, item) end
+        items[#items+1] = item
+    end
+    for _, name in ipairs(files) do
+        local item = { text = name, kind = "file", name = name, path = path_join(dir, name) }
+        item.hold_callback = function() show_item_actions(menu, dir, item) end
+        items[#items+1] = item
+    end
+    if not ok then items[#items+1] = { text = _("Cannot read this folder"), kind = "noop" } end
+    logger.info("minfolio open_notes: showing", #items, "items")
+    menu = Menu:new{
+        title = _("Minfolio") .. " - " .. (dir == NOTES_DIR and path_base(NOTES_DIR) or dir),
+        item_table = items,
+        is_popout = false,
+        handle_hold_on_hold_release = true,
+        title_bar_left_icon = "appbar.menu",
+        onLeftButtonTap = function()
+            show_controls({ { text = "⟲ " .. _("Rotate screen"), callback = rotate_screen_ccw } })
+        end,
+        onMenuSelect = function(_self, item)
+            -- keep this list open underneath; the editor closes back to it (not the file manager)
+            if item.kind == "new_note" then show_new_entry_dialog(menu, dir, "note")
+            elseif item.kind == "new_folder" then show_new_entry_dialog(menu, dir, "folder")
+            elseif item.is_open then open_markdown_picker(dir)
+            elseif item.kind == "dir_nav" then refresh_file_manager(menu, item.path)
+            elseif item.kind == "dir" then refresh_file_manager(menu, item.path)
+            elseif item.kind == "file" then
+                if is_markdown_file(item.name) then edit_note(item.path) else show_item_actions(menu, dir, item) end
+            end
+        end,
+        onMenuHold = function(_self, item)
+            logger.info("minfolio file manager hold:", item and item.name, item and item.kind)
+            if item and item.hold_callback then
+                item.hold_callback()
+            elseif item and (item.kind == "dir" or item.kind == "file") then
+                show_item_actions(menu, dir, item)
+            end
+            return true
+        end,
+    }
+    UIManager:show(menu)
+end
+
+local function open_notes()
+    show_file_manager(NOTES_DIR)
 end
 
 -- ============================ Plugin ============================
@@ -2279,7 +2900,10 @@ function Minfolio:pollLaunchFlag()
 end
 
 function Minfolio:onResume()
-    -- Frontlight is owned by the Kindle framework (lipc); nothing to restore on wake.
+    -- The Kindle framework owns the light; resync labels/state and repaint after
+    -- the screensaver/framework wake transition settles.
+    fl_restore_if_needed()
+    schedule_wake_repaint()
 end
 
 function Minfolio:onDispatcherRegisterActions()
@@ -2288,35 +2912,7 @@ function Minfolio:onDispatcherRegisterActions()
 end
 
 function Minfolio:init()
-    -- KOReader's Kindle keymap doesn't map some BT-keyboard keys (minus/equals/etc.) so they get
-    -- dropped before any handler sees them. Fill the gaps (only where unmapped).
-    local em = Device.input and Device.input.event_map
-    if em then
-        for code, name in pairs({
-            [12]="-", [13]="=", [26]="[", [27]="]", [41]="`", [43]="\\",   -- missing symbol keys
-            [102]="Home", [103]="Up", [104]="PageUp", [105]="Left", [106]="Right", [107]="End",
-            [108]="Down", [109]="PageDown",
-            [56]="Alt", [100]="Alt", [29]="Ctrl", [97]="Ctrl", [54]="Shift",  -- untracked modifier keys
-        }) do
-            if not em[code] then em[code] = name end
-        end
-        em[29], em[97] = "Ctrl", "Ctrl"
-        em[56], em[100] = "Alt", "Alt"
-        em[42], em[54] = "Shift", "Shift"
-        em[125], em[126] = "Meta", "Meta"  -- Command/Super; shortcut_mod treats Meta like Ctrl.
-    end
-    if Device.input and Device.input.modifiers then
-        Device.input.modifiers.Ctrl = Device.input.modifiers.Ctrl or false
-        Device.input.modifiers.LCtrl = Device.input.modifiers.LCtrl or false
-        Device.input.modifiers.RCtrl = Device.input.modifiers.RCtrl or false
-        Device.input.modifiers.Alt = Device.input.modifiers.Alt or false
-        Device.input.modifiers.LAlt = Device.input.modifiers.LAlt or false
-        Device.input.modifiers.RAlt = Device.input.modifiers.RAlt or false
-        Device.input.modifiers.Shift = Device.input.modifiers.Shift or false
-        Device.input.modifiers.Meta = Device.input.modifiers.Meta or false
-        Device.input.modifiers.LMeta = Device.input.modifiers.LMeta or false
-        Device.input.modifiers.RMeta = Device.input.modifiers.RMeta or false
-    end
+    install_keyboard_aliases()
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
     if not _G.__minfolio_launch_polling then
