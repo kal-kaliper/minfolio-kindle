@@ -8,6 +8,7 @@ local GestureRange = require("ui/gesturerange")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local CenterContainer = require("ui/widget/container/centercontainer")
+local LeftContainer = require("ui/widget/container/leftcontainer")
 local BottomContainer = require("ui/widget/container/bottomcontainer")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local VerticalGroup = require("ui/widget/verticalgroup")
@@ -647,7 +648,7 @@ local function same_file_signature(a, b)
     if not a or not b then return false end
     return a.mode == b.mode and a.size == b.size and a.modification == b.modification
 end
-local open_markdown_picker, rotate_screen_ccw   -- fwd decls
+local open_markdown_picker, rotate_screen_ccw, show_file_manager   -- fwd decls
 -- Only ever one editor at a time. Opening a note while another editor is live
 -- (e.g. a re-send via kindle-send, or a duplicate launch-flag write) must not
 -- stack a second MDEdit on the same file: both keep polling the file and each
@@ -1121,7 +1122,10 @@ function MDEdit:layoutTable(tbl, availw)
         local style = tr.header and "bold" or "normal"
         for c = 1, tbl.ncols do
             local cell = tr.cells[c]
-            nat[c] = math.max(nat[c], self:wordw(cell and cell.text or "", style) + pad_x2)
+            -- Reserve padding + the cell's 1px left/right borders (the same 2px the
+            -- wrap width subtracts below) + a little rounding slack, so a column
+            -- sized to its own text never wraps that text mid-word.
+            nat[c] = math.max(nat[c], self:wordw(cell and cell.text or "", style) + pad_x2 + 4)
         end
     end
     local natsum = 0
@@ -1187,20 +1191,28 @@ function MDEdit:layoutTable(tbl, availw)
 end
 function MDEdit:tableCell(lines, colw, rowh, style, align)
     local pad_x = math.floor(MDEDIT_TABLE_PAD_X * self.scale)
-    local pad_y = math.floor(MDEDIT_TABLE_PAD_Y * self.scale)
+    local border = 1
+    -- FrameContainer:getSize() ignores its own `width`/`height` and measures its
+    -- content, so passing width=colw does NOT make a cell occupy the column -- the
+    -- row then packs cells at their text width and columns drift out of alignment.
+    -- Wrap the content in a fixed-`dimen` LeftContainer so every cell in a column
+    -- is exactly colw x rowh and the columns line up across rows.
+    local inner_w = math.max(1, colw - 2 * border)
+    local inner_h = math.max(1, rowh - 2 * border)
     local face = md_face(style, self.scale)
-    local vg = VerticalGroup:new{ align = "left", VerticalSpan:new{ width = pad_y } }
+    local vg = VerticalGroup:new{ align = "left" }
     for _, ln in ipairs(lines or { "" }) do
         local tw = self:textw(ln, face)
         local left = pad_x
-        if align == "right" then left = math.max(pad_x, colw - pad_x - tw)
-        elseif align == "center" then left = math.max(pad_x, math.floor((colw - tw) / 2)) end
+        if align == "right" then left = math.max(pad_x, inner_w - pad_x - tw)
+        elseif align == "center" then left = math.max(pad_x, math.floor((inner_w - tw) / 2)) end
         vg[#vg+1] = HorizontalGroup:new{
             HorizontalSpan:new{ width = left },
             TextWidget:new{ text = ln, face = face, fgcolor = Blitbuffer.COLOR_BLACK },
         }
     end
-    return FrameContainer:new{ bordersize = 1, padding = 0, margin = 0, width = colw, height = rowh, vg }
+    return FrameContainer:new{ bordersize = border, padding = 0, margin = 0,
+        LeftContainer:new{ dimen = Geom:new{ w = inner_w, h = inner_h }, vg } }
 end
 function MDEdit:renderTableRow(vr)
     local style = vr.header and "bold" or "normal"
@@ -1369,20 +1381,18 @@ function MDEdit:computeVisualRows(text_w)
     end
     local i = 1
     while i <= #self.lines do
-        if self.reader_mode then
-            local tbl = md_table_block(self.lines, i)
-            if tbl then
-                for _, entry in ipairs(self:layoutTable(tbl, text_w)) do
-                    out[#out+1] = entry
-                end
-                if tbl.finish < #self.lines then
-                    out[#out+1] = { kind = "gap", line = tbl.finish, h = MDEDIT_PARA_GAP }
-                end
-                i = tbl.finish + 1
-            else
-                appendLine(i)
-                i = i + 1
+        -- Tables render as tables in every mode (edit and reader). Cells are
+        -- edited by tapping them (openTableCellEditor); the raw pipe syntax is
+        -- never shown as plain text.
+        local tbl = md_table_block(self.lines, i)
+        if tbl then
+            for _, entry in ipairs(self:layoutTable(tbl, text_w)) do
+                out[#out+1] = entry
             end
+            if tbl.finish < #self.lines then
+                out[#out+1] = { kind = "gap", line = tbl.finish, h = MDEDIT_PARA_GAP }
+            end
+            i = tbl.finish + 1
         else
             appendLine(i)
             i = i + 1
@@ -2577,6 +2587,13 @@ function MDEdit:onTap(_, ges)
         UIManager:scheduleIn(MDEDIT_READER_DTAP, fn)
         return true
     end
+    -- Tables render as tables in edit mode too, so a tap on a cell edits that
+    -- cell (rather than trying to drop a text caret into a rendered table).
+    local table_hit = self:tableCellAtPos(p)
+    if table_hit then
+        self:openTableCellEditor(table_hit)
+        return true
+    end
     local now = now_seconds()
     local tap_row, tap_col = self:pointToCursor(p)
     if self._last_tap and now - self._last_tap.t < MDEDIT_EDIT_DTAP
@@ -2700,10 +2717,17 @@ local function edit_note(path)
         -- and unsaved edits) instead of stacking a duplicate that would fight it.
         if active_mdedit.path == path then return end
         -- Switching files: flush and close the current editor first so only one
-        -- editor (and one file poller) is ever live.
+        -- editor (and one file poller) is ever live. Suppress its on_close so we
+        -- don't bounce through the listing on the way to the next note.
+        active_mdedit.on_close = nil
         active_mdedit:saveAndClose()
     end
-    local ed = MDEdit:new{ path = path }
+    -- Closing the document always returns to the Minfolio file listing at the
+    -- note's folder -- even when the note was opened by a send from the computer
+    -- (launch flag), which otherwise would drop back to KOReader.
+    local ed = MDEdit:new{ path = path, on_close = function()
+        if show_file_manager then show_file_manager(path_parent(path)) end
+    end }
     active_mdedit = ed
     UIManager:show(ed, "full")   -- "full" forces a complete repaint over the menu
 end
@@ -2814,8 +2838,6 @@ open_markdown_picker = function(start_dir)
     UIManager:show(menu)
 end
 
-local show_file_manager
-
 local function refresh_file_manager(menu, dir)
     if menu then UIManager:close(menu) end
     show_file_manager(dir)
@@ -2843,7 +2865,7 @@ local function show_new_entry_dialog(menu, dir, kind)
                     end
                 else
                     if write_file(path, "") then
-                        refresh_file_manager(menu, dir)
+                        if menu then UIManager:close(menu) end
                         edit_note(path)
                     else
                         notify(_("Could not create note"))
@@ -2897,37 +2919,35 @@ local function confirm_delete(parent_menu, dir, item)
 end
 
 local function show_item_actions(parent_menu, dir, item)
-    local actions = {}
-    if item.kind == "dir" then
-        actions[#actions+1] = { text = _("Open folder"), callback = function()
-            refresh_file_manager(parent_menu, item.path)
-        end }
-    elseif is_markdown_file(item.name) then
-        actions[#actions+1] = { text = _("Open"), callback = function()
-            edit_note(item.path)
-        end }
+    -- A ButtonDialog is the right widget for a long-press context menu: it sizes
+    -- itself to its buttons (big tap targets, no empty filler), unlike a fixed-
+    -- height Menu which renders a few tiny rows in a mostly-blank box.
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local dialog
+    local function act(cb)
+        return function() UIManager:close(dialog); UIManager:scheduleIn(0.01, cb) end
     end
-    actions[#actions+1] = { text = _("Rename"), callback = function() show_rename_dialog(parent_menu, dir, item) end }
-    actions[#actions+1] = { text = _("Delete"), callback = function() confirm_delete(parent_menu, dir, item) end }
-
-    -- A compact centered popup (context menu) sized to its few actions, rather
-    -- than a full-screen list -- long-press should feel like a contextual menu.
-    local n = #actions
-    local box_h = math.min(math.floor(Screen:getHeight() * 0.7),
-        Screen:scaleBySize(96 + n * 58))
-    local menu
-    menu = Menu:new{
+    local buttons = {}
+    if item.kind == "dir" then
+        buttons[#buttons+1] = {{ text = _("Open folder"),
+            callback = act(function() refresh_file_manager(parent_menu, item.path) end) }}
+    elseif is_markdown_file(item.name) then
+        buttons[#buttons+1] = {{ text = _("Open"), callback = act(function()
+            if parent_menu then UIManager:close(parent_menu) end
+            edit_note(item.path)
+        end) }}
+    end
+    buttons[#buttons+1] = {{ text = _("Rename"),
+        callback = act(function() show_rename_dialog(parent_menu, dir, item) end) }}
+    buttons[#buttons+1] = {{ text = _("Delete"),
+        callback = act(function() confirm_delete(parent_menu, dir, item) end) }}
+    dialog = ButtonDialog:new{
         title = item.name,
-        item_table = actions,
-        is_popout = true,
-        width = math.floor(Screen:getWidth() * 0.62),
-        height = box_h,
-        onMenuSelect = function(_self, action)
-            UIManager:close(menu)
-            if action.callback then UIManager:scheduleIn(0.01, action.callback) end
-        end,
+        title_align = "center",
+        width_factor = 0.72,
+        buttons = buttons,
     }
-    UIManager:show(menu)
+    UIManager:show(dialog)
 end
 
 show_file_manager = function(start_dir)
@@ -2987,14 +3007,15 @@ show_file_manager = function(start_dir)
         handle_hold_on_hold_release = true,
         custom_title_bar = title_bar,
         onMenuSelect = function(_self, item)
-            -- keep this list open underneath; the editor closes back to it (not the file manager)
+            -- The editor is fullscreen and returns here via its on_close, so close
+            -- this listing rather than leaving it stacked underneath.
             if item.kind == "new_note" then show_new_entry_dialog(menu, dir, "note")
             elseif item.kind == "new_folder" then show_new_entry_dialog(menu, dir, "folder")
             elseif item.is_open then open_markdown_picker(dir)
             elseif item.kind == "dir_nav" then refresh_file_manager(menu, item.path)
             elseif item.kind == "dir" then refresh_file_manager(menu, item.path)
             elseif item.kind == "file" then
-                if is_markdown_file(item.name) then edit_note(item.path) else show_item_actions(menu, dir, item) end
+                if is_markdown_file(item.name) then UIManager:close(menu); edit_note(item.path) else show_item_actions(menu, dir, item) end
             end
         end,
         onMenuHold = function(_self, item)
