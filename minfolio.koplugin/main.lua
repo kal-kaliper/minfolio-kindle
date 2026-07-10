@@ -648,6 +648,13 @@ local function same_file_signature(a, b)
     return a.mode == b.mode and a.size == b.size and a.modification == b.modification
 end
 local open_markdown_picker, rotate_screen_ccw   -- fwd decls
+-- Only ever one editor at a time. Opening a note while another editor is live
+-- (e.g. a re-send via kindle-send, or a duplicate launch-flag write) must not
+-- stack a second MDEdit on the same file: both keep polling the file and each
+-- one's autosave looks like an external change to the other, producing a
+-- "Reloaded from disk" storm and a half-repainted screen. edit_note() enforces
+-- the singleton; MDEdit clears it on close.
+local active_mdedit
 local function notify(text)
     UIManager:show(Notification:new{ text = text, timeout = 3 })
 end
@@ -2225,6 +2232,7 @@ function MDEdit:saveAndOpenMarkdown()
 end
 function MDEdit:onCloseWidget()
     self._closing = true
+    if active_mdedit == self then active_mdedit = nil end
     self:flushAutosave()
     self._caret_blinking = false
     if self._file_poll_pending then UIManager:unschedule(self._file_poll_pending); self._file_poll_pending = nil end
@@ -2681,7 +2689,17 @@ end
 -- ============================ Minfolio (native KOReader) ============================
 local function edit_note(path)
     fl_restore_if_needed()
-    UIManager:show(MDEdit:new{ path = path }, "full")   -- "full" forces a complete repaint over the menu
+    if active_mdedit and not active_mdedit._closing then
+        -- Already editing this exact file: keep the live editor (with its cursor
+        -- and unsaved edits) instead of stacking a duplicate that would fight it.
+        if active_mdedit.path == path then return end
+        -- Switching files: flush and close the current editor first so only one
+        -- editor (and one file poller) is ever live.
+        active_mdedit:saveAndClose()
+    end
+    local ed = MDEdit:new{ path = path }
+    active_mdedit = ed
+    UIManager:show(ed, "full")   -- "full" forces a complete repaint over the menu
 end
 
 -- Rotates the whole device screen 90° counter-clockwise (repeat to cycle through
