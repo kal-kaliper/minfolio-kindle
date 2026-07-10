@@ -16,6 +16,8 @@ local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local LineWidget = require("ui/widget/linewidget")
 local Menu = require("ui/widget/menu")
+local TitleBar = require("ui/widget/titlebar")
+local Size = require("ui/size")
 local TextWidget = require("ui/widget/textwidget")
 local IconWidget = require("ui/widget/iconwidget")
 local Font = require("ui/font")
@@ -69,6 +71,42 @@ local function battery_status_text()
         if cap then return tostring(cap) .. "%" end
     end
     return ""
+end
+local function battery_info()
+    local ok, pd = pcall(function() return Device:getPowerDevice() end)
+    if not (ok and pd and pd.getCapacity) then return nil end
+    local cap = pd:getCapacity()
+    if not cap then return nil end
+    local charging = false
+    local cok, c = pcall(function() return pd:isCharging() end)
+    if cok then charging = not not c end
+    return { cap = math.max(0, math.min(100, math.floor(cap))), charging = charging }
+end
+-- A hand-drawn Kindle-style battery pill (outline + proportional fill + nub) with
+-- the percentage beside it. Drawn from primitives so it never depends on an icon
+-- font/asset being present, and stays crisp at the device DPI.
+local function battery_indicator()
+    local info = battery_info()
+    if not info then return nil end
+    local bs = function(px) return Screen:scaleBySize(px) end
+    local bw, bh, pad = bs(22), bs(13), bs(1)
+    local inner_w = bw - 2 * (1 + pad)
+    local inner_h = bh - 2 * (1 + pad)
+    local fill_w = info.charging and inner_w or math.max(0, math.min(inner_w, math.floor(inner_w * info.cap / 100)))
+    local fill = HorizontalGroup:new{ align = "top" }
+    if fill_w > 0 then
+        fill[#fill+1] = LineWidget:new{ background = Blitbuffer.COLOR_BLACK, dimen = Geom:new{ w = fill_w, h = inner_h } }
+    end
+    if inner_w - fill_w > 0 then
+        fill[#fill+1] = LineWidget:new{ background = Blitbuffer.Color8(215), dimen = Geom:new{ w = inner_w - fill_w, h = inner_h } }
+    end
+    local body = FrameContainer:new{ bordersize = 1, radius = bs(2), padding = pad, margin = 0,
+        width = bw, height = bh, fill }
+    local nub = CenterContainer:new{ dimen = Geom:new{ w = bs(3), h = bh },
+        LineWidget:new{ background = Blitbuffer.COLOR_BLACK, dimen = Geom:new{ w = bs(2), h = bs(6) } } }
+    local pct = TextWidget:new{ text = tostring(info.cap) .. "%",
+        face = Font:getFace("cfont", 17), fgcolor = Blitbuffer.COLOR_BLACK }
+    return HorizontalGroup:new{ align = "center", body, nub, HorizontalSpan:new{ width = bs(5) }, pct }
 end
 local function write_file(path, data)
     local f = io.open(path, "w")
@@ -706,7 +744,7 @@ function MDEdit:scheduleCaretBlink()
         self:rebuild()
         local region
         if prev_vtop and self.vtop and prev_vtop ~= self.vtop then
-            region = self.editor_refresh_region
+            region = self.editor_body_region
         else
             region = self:unionRegion(prev_caret, self.caret_region)
         end
@@ -831,7 +869,9 @@ function MDEdit:topBar(cw)
                 TextWidget:new{ text = "Edit", face = edit_face, fgcolor = Blitbuffer.COLOR_BLACK } },
         }
     end
-    local tools = { "H", "B", "I", "\226\128\162", "1.", "\226\152\144", "\226\150\164" }
+    -- Reader glyph is a rectangle split into two columns (◫, vertical bisecting
+    -- line) so it reads as a two-column page rather than many thin bars.
+    local tools = { "H", "B", "I", "\226\128\162", "1.", "\226\152\144", "\226\151\171" }
     local divider_w = #tools * MDEDIT_TOOL_DIVIDER
     local min_action_w = ((#tools + 1) * MDEDIT_TOOL_MIN_CELL) + divider_w
     local max_title_w = math.min(MDEDIT_TITLE_W, math.max(80, cw - MDEDIT_MENU_W - min_action_w - MDEDIT_TITLE_ACTION_GAP))
@@ -1508,6 +1548,13 @@ function MDEdit:rebuild()
         x = 0, y = 0, w = self.fw,
         h = math.max(1, editor_top + budget + progress_area + MDEDIT_PAD),
     }
+    -- Same as editor_refresh_region but starting below the top bar. The toolbar/
+    -- title never change while scrolling, selecting, or reflowing text, so those
+    -- repaints should leave it untouched (no e-ink flash of a stable strip).
+    self.editor_body_region = Geom:new{
+        x = 0, y = editor_top, w = self.fw,
+        h = math.max(1, budget + progress_area + MDEDIT_PAD),
+    }
     -- The progress bar is pinned to the very bottom of the screen (below the text
     -- frame's padding) so it holds a fixed position regardless of how much text is
     -- on screen, and never crowds the last line.
@@ -1515,7 +1562,7 @@ function MDEdit:rebuild()
         dimen = Geom:new{ x = 0, y = 0, w = self.fw, h = self.fh },
         FrameContainer:new{ background = Blitbuffer.COLOR_WHITE, bordersize = 0, padding = MDEDIT_PAD,
             width = self.fw, height = self.fh, vg },
-        BottomContainer:new{ dimen = Geom:new{ w = self.fw, h = self.fh - 3 }, self:progressBar(cw) },
+        BottomContainer:new{ dimen = Geom:new{ w = self.fw, h = self.fh - 5 }, self:progressBar(cw) },
     }
 end
 -- Bounding bands (full width) of logical-line rows, for narrow e-ink refreshes
@@ -1635,7 +1682,7 @@ function MDEdit:refresh(opts)
     if opts.full then
         region = self.editor_refresh_region
     elseif selection_dirty or vtop_changed then
-        region = self.editor_refresh_region
+        region = self.editor_body_region
     elseif reflow or line_geometry_changed then
         if self.keyboard then
             region = self.editor_refresh_region
@@ -1690,7 +1737,7 @@ end
 function MDEdit:refreshScroll()
     self.caret_on = true
     self:rebuild()
-    UIManager:setDirty(self, "ui", self.editor_refresh_region)
+    UIManager:setDirty(self, "ui", self.editor_body_region)
 end
 function MDEdit:scheduleAutosave()
     self._dirty = true
@@ -2072,7 +2119,10 @@ function MDEdit:setReaderMode(enabled, target_row, target_col)
         self.caret_on = true
         notify(_("Editing mode"))
     end
-    self:refresh()
+    -- The top bar itself changes on a mode switch (formatting tools <-> "Edit"),
+    -- so force a full repaint; the partial-region paths only cover the text body
+    -- and would leave a stale toolbar when the keyboard is hidden.
+    self:refresh{ full = true }
 end
 function MDEdit:onSwitchingKeyboardLayout() end
 function MDEdit:showKeyboard()
@@ -2836,11 +2886,18 @@ local function show_item_actions(parent_menu, dir, item)
     actions[#actions+1] = { text = _("Rename"), callback = function() show_rename_dialog(parent_menu, dir, item) end }
     actions[#actions+1] = { text = _("Delete"), callback = function() confirm_delete(parent_menu, dir, item) end }
 
+    -- A compact centered popup (context menu) sized to its few actions, rather
+    -- than a full-screen list -- long-press should feel like a contextual menu.
+    local n = #actions
+    local box_h = math.min(math.floor(Screen:getHeight() * 0.7),
+        Screen:scaleBySize(96 + n * 58))
     local menu
     menu = Menu:new{
         title = item.name,
         item_table = actions,
-        is_popout = false,
+        is_popout = true,
+        width = math.floor(Screen:getWidth() * 0.62),
+        height = box_h,
         onMenuSelect = function(_self, action)
             UIManager:close(menu)
             if action.callback then UIManager:scheduleIn(0.01, action.callback) end
@@ -2875,15 +2932,36 @@ show_file_manager = function(start_dir)
     end
     if not ok then items[#items+1] = { text = _("Cannot read this folder"), kind = "noop" } end
     logger.info("minfolio open_notes: showing", #items, "items")
+    -- Custom title bar so we can show a Kindle-style battery indicator to the left
+    -- of the close (X) icon. TitleBar only exposes a single right icon (the close
+    -- button), so the battery is added as an extra right-aligned overlap child.
+    local title_text = _("Minfolio") .. " - " .. (dir == NOTES_DIR and path_base(NOTES_DIR) or dir)
+    local title_bar = TitleBar:new{
+        width = Screen:getWidth(),
+        align = "center",
+        title = title_text,
+        with_bottom_line = true,
+        left_icon = "appbar.menu",
+        left_icon_tap_callback = function()
+            show_controls({ { text = "⟲ " .. _("Rotate screen"), callback = rotate_screen_ccw } })
+        end,
+        close_callback = function() if menu then menu:onClose() end end,
+    }
+    local batt = battery_indicator()
+    if batt then
+        local batt_cell = CenterContainer:new{
+            dimen = Geom:new{ w = batt:getSize().w, h = title_bar:getHeight() }, batt }
+        table.insert(title_bar, HorizontalGroup:new{
+            align = "center", overlap_align = "right",
+            batt_cell, HorizontalSpan:new{ width = Screen:scaleBySize(44) },
+        })
+    end
     menu = Menu:new{
-        title = _("Minfolio") .. " - " .. (dir == NOTES_DIR and path_base(NOTES_DIR) or dir),
+        title = title_text,
         item_table = items,
         is_popout = false,
         handle_hold_on_hold_release = true,
-        title_bar_left_icon = "appbar.menu",
-        onLeftButtonTap = function()
-            show_controls({ { text = "⟲ " .. _("Rotate screen"), callback = rotate_screen_ccw } })
-        end,
+        custom_title_bar = title_bar,
         onMenuSelect = function(_self, item)
             -- keep this list open underneath; the editor closes back to it (not the file manager)
             if item.kind == "new_note" then show_new_entry_dialog(menu, dir, "note")
@@ -2905,6 +2983,9 @@ show_file_manager = function(start_dir)
             return true
         end,
     }
+    title_bar.show_parent = menu
+    if title_bar.left_button then title_bar.left_button.show_parent = menu end
+    if title_bar.right_button then title_bar.right_button.show_parent = menu end
     UIManager:show(menu)
 end
 
