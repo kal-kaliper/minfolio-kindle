@@ -1291,20 +1291,25 @@ function MDEdit:openTableCellEditor(hit)
     if self._page_pending then UIManager:unschedule(self._page_pending); self._page_pending = nil end
     self._rtap = nil
     local dlg
+    -- The dialog and its on-screen keyboard cover a large slice of the screen;
+    -- closing them only repaints that dialog region, leaving the editor beneath
+    -- half-blank. Force a full editor repaint on either exit.
+    local function dismiss(layout_dirty)
+        UIManager:close(dlg)
+        self:refresh{ layout_dirty = layout_dirty and true or false, full = true }
+    end
     dlg = InputDialog:new{
         title = string.format(_("Table cell %d"), hit.col or 1),
         input = hit.cell.text or "",
         buttons = {{
-            { text = _("Cancel"), callback = function() UIManager:close(dlg) end },
+            { text = _("Cancel"), callback = function() dismiss(false) end },
             { text = _("Save"), is_enter_default = true, callback = function()
                 local value = dlg:getInputText() or ""
-                UIManager:close(dlg)
                 self:snapshot()
                 self._burst = nil
-                if self:replaceTableCell(hit, value) then
-                    self:save()
-                    self:refresh()
-                end
+                self:replaceTableCell(hit, value)
+                self:save()
+                dismiss(true)
             end },
         }},
     }
@@ -1626,16 +1631,13 @@ function MDEdit:lineTailRegions(row_map, row, col)
                     x = math.max(0, MDEDIT_PAD + self:rowXAt(rm.row, math.max(col or 0, rm.row.sb or 0)) - 2)
                     first = false
                 end
-                -- Only repaint out to where this row's text actually ends (plus one
-                -- glyph's worth, to cover a just-typed/shifted character), not all
-                -- the way to the screen edge. Refreshing the blank space to the
-                -- right just flashes an empty rectangle on e-ink for no reason.
-                local text_right = MDEDIT_PAD + (rm.row.w or 0) + self:rowTextHeight(rm.row) + 8
-                local right = math.min(self.fw, math.max(x + 1, text_right))
+                -- Repaint the whole tail out to the screen edge. Capping this to the
+                -- text width left stale glyphs while typing (partial e-ink updates
+                -- didn't clear the old pixels), which read as garbled text.
                 regions[#regions+1] = Geom:new{
                     x = x,
                     y = math.max(0, rm.y0 - 2),
-                    w = right - x,
+                    w = math.max(1, self.fw - x),
                     h = (rm.y1 - rm.y0) + 4,
                 }
             end
@@ -2189,6 +2191,25 @@ function MDEdit:isKeyboardRevealGesture(ges)
     local upward = (ges.direction == "north") or dy <= -MDEDIT_KEYBOARD_SWIPE_DY
     return center and from_bottom and upward
 end
+-- Inverse of the reveal gesture: a downward swipe that STARTS just above the
+-- keyboard's top edge hides it. The keyboard's own keys swallow swipes, so the
+-- gesture has to begin in the text area (which the editor reliably receives),
+-- right where the text meets the keyboard -- a deliberate "push it down" motion.
+function MDEdit:isKeyboardHideGesture(ges)
+    if not self.keyboard then return false end
+    local p = ges and ges.pos
+    local sp = ges and ges.start_pos or p
+    if not p or not sp then return false end
+    local kbd_h = (self.keyboard.dimen and self.keyboard.dimen.h) or math.floor(self.fh * 0.36)
+    local kbd_top = self.fh - kbd_h
+    local start_y = sp.y or p.y or 0
+    local dy = (p.y or 0) - (sp.y or 0)
+    -- Start within the strip just above the keyboard (in the text area, so we get
+    -- the event), moving downward.
+    local near_kbd_top = start_y >= kbd_top - MDEDIT_KEYBOARD_SWIPE_EDGE and start_y <= kbd_top
+    local downward = (ges.direction == "south") or dy >= MDEDIT_KEYBOARD_SWIPE_DY
+    return near_kbd_top and downward
+end
 function MDEdit:save()
     local text = self:currentText()
     local out = io.open(self.path, "w")
@@ -2229,6 +2250,25 @@ function MDEdit:onResume()
     self.caret_on = true
     self:refresh{ layout_dirty = false, full = true }
     schedule_wake_repaint()
+end
+-- A Bluetooth/USB keyboard attaching or detaching repaints chrome (and can close
+-- the on-screen keyboard) outside our control, leaving the screen half-blank.
+-- With a physical keyboard there is no need for the on-screen one, so hide it;
+-- either way force a full repaint so nothing is left stale. Return nothing so the
+-- broadcast keeps propagating to other widgets.
+function MDEdit:onPhysicalKeyboardConnected()
+    -- The external-keyboard plugin rebuilds Device.input.event_map from scratch on
+    -- attach (and re-inits input events), wiping our key aliases -- Fn/page keys,
+    -- symbol keys, modifier flags. Re-apply them so e.g. Fn+Down keeps paging.
+    install_keyboard_aliases()
+    if self.keyboard then
+        self:hideKeyboard()             -- hideKeyboard already does a full repaint
+    else
+        self:refresh{ layout_dirty = false, full = true }
+    end
+end
+function MDEdit:onPhysicalKeyboardDisconnected()
+    self:refresh{ layout_dirty = false, full = true }
 end
 function MDEdit:saveAndClose()
     self:save()
@@ -2333,9 +2373,17 @@ function MDEdit:onSwipe(_, ges)
         self:showKeyboard()
         return true
     end
+    if self:isKeyboardHideGesture(ges) then
+        if self._pan_reset then UIManager:unschedule(self._pan_reset); self._pan_reset = nil end
+        self._pan_active = nil
+        self._pan_paged = nil
+        self._pan_mode = nil
+        self:hideKeyboard()
+        return true
+    end
     -- Paging is handled in onPan, so swipes only clear the current gesture mode.
-    -- Do not hide the keyboard here; accidental south swipes are common while
-    -- editing near the on-screen keyboard.
+    -- Do not hide the keyboard on arbitrary south swipes (accidental ones are
+    -- common while editing); the deliberate hide gesture above handles it.
     if self._pan_reset then UIManager:unschedule(self._pan_reset); self._pan_reset = nil end
     self._pan_active = nil
     self._pan_paged = nil
@@ -2682,6 +2730,12 @@ function MDEdit:onPan(_, ges)
         self:showKeyboard()
         return true
     end
+    if self:isKeyboardHideGesture(ges) then
+        self._pan_mode = "keyboard"
+        self._pan_paged = true
+        self:hideKeyboard()
+        return true
+    end
     if not self._pan_mode then
         if math.max(adx, ady) < MDEDIT_SELECT_PAN_MIN then return true end
         if adx >= ady * 1.2 then
@@ -2993,8 +3047,10 @@ show_file_manager = function(start_dir)
     }
     local batt = battery_indicator()
     if batt then
+        -- Vertically centered in the title bar, then nudged up ~8px: shrinking the
+        -- centering box's height by 16 raises the centered battery by half that.
         local batt_cell = CenterContainer:new{
-            dimen = Geom:new{ w = batt:getSize().w, h = title_bar:getHeight() }, batt }
+            dimen = Geom:new{ w = batt:getSize().w, h = math.max(1, title_bar:getHeight() - 16) }, batt }
         table.insert(title_bar, HorizontalGroup:new{
             align = "center", overlap_align = "right",
             batt_cell, HorizontalSpan:new{ width = Screen:scaleBySize(44) },
