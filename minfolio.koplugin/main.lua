@@ -1616,10 +1616,16 @@ function MDEdit:lineTailRegions(row_map, row, col)
                     x = math.max(0, MDEDIT_PAD + self:rowXAt(rm.row, math.max(col or 0, rm.row.sb or 0)) - 2)
                     first = false
                 end
+                -- Only repaint out to where this row's text actually ends (plus one
+                -- glyph's worth, to cover a just-typed/shifted character), not all
+                -- the way to the screen edge. Refreshing the blank space to the
+                -- right just flashes an empty rectangle on e-ink for no reason.
+                local text_right = MDEDIT_PAD + (rm.row.w or 0) + self:rowTextHeight(rm.row) + 8
+                local right = math.min(self.fw, math.max(x + 1, text_right))
                 regions[#regions+1] = Geom:new{
                     x = x,
                     y = math.max(0, rm.y0 - 2),
-                    w = math.max(1, self.fw - x),
+                    w = right - x,
                     h = (rm.y1 - rm.y0) + 4,
                 }
             end
