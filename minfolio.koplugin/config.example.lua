@@ -5,6 +5,6 @@
 
 return {
     notes_dir = "/mnt/us/notes",
-    state_dir = "/mnt/us/minfolio",
+    state_dir = "/mnt/us/.minfolio",
     minfolio_scale = 1.0,
 }

@@ -27,11 +27,13 @@ local Blitbuffer = require("ffi/blitbuffer")
 local UIManager = require("ui/uimanager")
 local Event = require("ui/event")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local Widget = require("ui/widget/widget")
 local InputDialog = require("ui/widget/inputdialog")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Notification = require("ui/widget/notification")
 local lfs = require("libs/libkoreader-lfs")
 local socket = require("socket")
+rapidjson = require("rapidjson")
 local logger = require("logger")
 local _ = require("gettext")
 local Screen = Device.screen
@@ -56,15 +58,94 @@ end
 
 local CONFIG = load_local_config()
 local NOTES_DIR = CONFIG.notes_dir or "/mnt/us/notes"
-local STATE_DIR = CONFIG.state_dir or "/mnt/us/minfolio"
+local STATE_DIR = CONFIG.state_dir or "/mnt/us/.minfolio"
+MINFOLIO_REMOTE_DIR = "/mnt/us/.minfolio-remote"
 local FL_STATE_PATH = STATE_DIR .. "/frontlight.lua"
 local MINFOLIO_STATE_PATH = STATE_DIR .. "/state.lua"
+MINFOLIO_PAIR_PATH = STATE_DIR .. "/pairing.lua"
+-- Migrate only the old persistent settings; remote session caches are disposable.
+if not CONFIG.state_dir and lfs.attributes("/mnt/us/minfolio", "mode") == "directory" and lfs.attributes(STATE_DIR, "mode") ~= "directory" then
+    lfs.mkdir(STATE_DIR)
+    os.rename("/mnt/us/minfolio/state.lua", MINFOLIO_STATE_PATH)
+    os.rename("/mnt/us/minfolio/frontlight.lua", FL_STATE_PATH)
+end
+MinfolioPair = { port = 42771 }
+function MinfolioPair.deviceId()
+    local f = io.open("/proc/usid", "r")
+    local id = f and f:read("*l") or nil
+    if f then f:close() end
+    return (id and id:gsub("[^%w]", "")) or "kindle"
+end
+function MinfolioPair.secret()
+    local f = io.open("/dev/urandom", "rb")
+    local raw = f and f:read(24) or tostring(os.time()) .. tostring(socket.gettime())
+    if f then f:close() end
+    return (raw:gsub(".", function(c) return string.format("%02x", string.byte(c)) end))
+end
+function MinfolioPair.post(cfg, path, body)
+    local sock = MinfolioRemote and MinfolioRemote.socket(cfg, 2)
+    if not sock then return false end
+    local raw = rapidjson.encode(body)
+    local req = "POST " .. path .. " HTTP/1.1\r\nHost: " .. cfg.host .. "\r\nContent-Type: application/json\r\nContent-Length: " .. #raw .. "\r\nConnection: close\r\n\r\n" .. raw
+    MinfolioRemote.sendAll(sock, req); pcall(function() sock:close() end)
+    return true
+end
+function MinfolioPair.showPrompt(msg)
+    if not (msg and msg.code and msg.host and msg.port and msg.fingerprint and msg.nonce) then return end
+    UIManager:show(ConfirmBox:new{ text = _("Pair with this desktop?\n\nVerification code: ") .. tostring(msg.code), ok_text = _("Pair"), ok_callback = function()
+        local cfg = { host = msg.host, port = tonumber(msg.port), cert_fingerprint = msg.fingerprint }
+        local secret = MinfolioPair.secret()
+        if MinfolioPair.post(cfg, "/kindle/pair", { nonce = msg.nonce, code = msg.code, deviceId = MinfolioPair.deviceId(), secret = secret }) then
+            lfs.mkdir(STATE_DIR)
+            local state = io.open(MINFOLIO_PAIR_PATH, "w")
+            if state then state:write(string.format("return { secret = %q }\n", secret)); state:close() end
+            notify(_("Desktop paired"))
+        else notify(_("Could not complete secure pairing")) end
+    end })
+end
+function MinfolioPair.pollRequest()
+    local flag = "/tmp/minfolio_pair_request"
+    local fp = io.open(flag, "r")
+    if not fp then return end
+    fp:close()
+    os.remove(flag)
+    local ok, msg = pcall(dofile, MINFOLIO_REMOTE_DIR .. "/pair-request.lua")
+    if ok then MinfolioPair.showPrompt(msg) end
+end
+function MinfolioPair.poll()
+    if not MinfolioPair.sock then return end
+    while true do
+        local raw, ip, reply_port = MinfolioPair.sock:receivefrom()
+        if not raw then break end
+        local ok, msg = pcall(function() return rapidjson.decode(raw) end)
+        if ok and msg.type == "minfolio-discover" and msg.nonce then
+            local reply = rapidjson.encode({ type = "minfolio-device", nonce = msg.nonce, id = MinfolioPair.deviceId(), label = "Kindle Minfolio" })
+            MinfolioPair.sock:sendto(reply, ip, reply_port)
+        elseif ok and msg.type == "minfolio-pair-request" then
+            MinfolioPair.showPrompt(msg)
+        end
+    end
+end
+function MinfolioPair.beacon()
+    if not MinfolioPair.sock then return end
+    local msg = rapidjson.encode({ type = "minfolio-device", id = MinfolioPair.deviceId(), label = "Kindle Minfolio" })
+    pcall(function() MinfolioPair.sock:sendto(msg, "255.255.255.255", MinfolioPair.port) end)
+end
+function MinfolioPair.start()
+    if MinfolioPair.sock then return end
+    local s = socket.udp(); if not s then return end
+    s:setsockname("*", MinfolioPair.port); s:setoption("broadcast", true); s:settimeout(0); MinfolioPair.sock = s
+    local function tick() MinfolioPair.poll(); MinfolioPair.pollRequest(); MinfolioPair.beacon(); UIManager:scheduleIn(0.75, tick) end
+    UIManager:scheduleIn(0.25, tick)
+end
 local function status_date_text()
     return os.date("%a, %d %b  %I:%M %p")
 end
 local function status_time_text()
     return os.date("%I:%M %p")
 end
+MinfolioBattery = MinfolioBattery or {}
+MinfolioBattery.refresh_interval = MinfolioBattery.refresh_interval or 60
 local function battery_status_text()
     local ok, pd = pcall(function() return Device:getPowerDevice() end)
     if ok and pd then
@@ -83,11 +164,22 @@ local function battery_info()
     if cok then charging = not not c end
     return { cap = math.max(0, math.min(100, math.floor(cap))), charging = charging }
 end
+function MinfolioBattery.infoKey(info)
+    if not info then return "" end
+    return tostring(info.cap) .. ":" .. (info.charging and "1" or "0")
+end
+function MinfolioBattery.indicatorWidth()
+    local bs = function(px) return Screen:scaleBySize(px) end
+    local pct = TextWidget:new{ text = "100%", face = Font:getFace("cfont", 17), fgcolor = Blitbuffer.COLOR_BLACK }
+    local w = bs(22) + bs(3) + bs(5) + pct:getSize().w
+    pct:free()
+    return w
+end
 -- A hand-drawn Kindle-style battery pill (outline + proportional fill + nub) with
 -- the percentage beside it. Drawn from primitives so it never depends on an icon
 -- font/asset being present, and stays crisp at the device DPI.
-local function battery_indicator()
-    local info = battery_info()
+local function battery_indicator(info)
+    info = info or battery_info()
     if not info then return nil end
     local bs = function(px) return Screen:scaleBySize(px) end
     local bw, bh, pad = bs(22), bs(13), bs(1)
@@ -110,14 +202,14 @@ local function battery_indicator()
     return HorizontalGroup:new{ align = "center", body, nub, HorizontalSpan:new{ width = bs(5) }, pct }
 end
 local function write_file(path, data)
-    local f = io.open(path, "w")
+    local f = io.open(path, "wb")
     if not f then return false end
     f:write(data)
     f:close()
     return true
 end
 local function read_file(path)
-    local f = io.open(path, "r")
+    local f = io.open(path, "rb")
     if not f then return nil end
     local data = f:read("*a")
     f:close()
@@ -203,6 +295,44 @@ local function fl_restore_if_needed()
     if b then FL.bright = b; FL.on = b > 0; if b > 0 then FL.last = b end end
     if FL_HAS_AMBER then local a = lipc_get("currentAmberLevel"); if a then FL.amber = a end end
 end
+function FL.captureBeforeSuspend()
+    if FL.wake_pending then
+        UIManager:unschedule(FL.wake_pending)
+        FL.wake_pending = nil
+        FL.before_suspend = nil
+    end
+    if FL.before_suspend then return end
+    fl_restore_if_needed()
+    FL.before_suspend = {
+        on = FL.on, bright = FL.bright, last = FL.last, amber = FL.amber,
+    }
+    save_frontlight_state()
+end
+function FL.scheduleWakeSync()
+    if FL.wake_pending then return end
+    local expected = FL.before_suspend
+    local fn
+    fn = function()
+        if FL.wake_pending == fn then FL.wake_pending = nil end
+        FL.before_suspend = nil
+        if expected then
+            -- powerd may still report its transient wake value during onResume.
+            -- Restore the state captured immediately before suspend only after the
+            -- Kindle framework has finished its own wake transition.
+            FL.on = expected.on
+            FL.bright = expected.on and expected.bright or 0
+            FL.last = expected.last
+            FL.amber = expected.amber
+            fl_apply()
+        else
+            -- A resume without a matching suspend (plugin loaded mid-session): do
+            -- not impose stale saved settings; just learn the settled hardware state.
+            fl_restore_if_needed()
+        end
+    end
+    FL.wake_pending = fn
+    UIManager:scheduleIn(1.1, fn)
+end
 local function fl_adjust(db, da)
     if db and db ~= 0 then
         FL.bright = math.max(0, math.min(FL_MAX, FL.bright + db))
@@ -276,29 +406,50 @@ local function md_color(style)
     return Blitbuffer.COLOR_BLACK
 end
 
-local function md_inline(text)
+-- `hl` (highlight) is a background flag carried through recursion, orthogonal to
+-- text style: everything parsed inside a ==...== region inherits it, so bold /
+-- italic / code inside a highlight keep their own style AND get the highlight fill.
+local function md_inline(text, hl)
     local spans, i, n, buf = {}, 1, #text, ""
-    local function push(t, s, display) if t ~= "" then spans[#spans+1] = { text = t, style = s, display = display } end end
+    local function push(t, s, display) if t ~= "" then spans[#spans+1] = { text = t, style = s, display = display, hl = hl or nil } end end
+    local function push_nested(inner, style)
+        for _, s in ipairs(md_inline(inner, hl)) do
+            if s.style ~= "syntax" then s.style = style end
+            spans[#spans+1] = s
+        end
+    end
     while i <= n do
         local c2 = text:sub(i, i+1)
         local c1 = text:sub(i, i)
         local closer, inner_start, marker
         if c2 == "**" then marker = "**"; inner_start = i+2
+        elseif c2 == "==" then marker = "=="; inner_start = i+2
         elseif c1 == "*" then marker = "*"; inner_start = i+1
         elseif c1 == "`" then marker = "`"; inner_start = i+1
         end
         if marker then closer = text:find(marker, inner_start, true) end
         if marker and closer then
             push(buf, "normal"); buf = ""
-            local sty = (marker == "**") and "bold" or (marker == "*") and "italic" or "code"
-            push(marker, "syntax", ""); push(text:sub(inner_start, closer-1), sty); push(marker, "syntax", "")
+            if marker == "==" then
+                -- Recurse so the highlight's contents keep their own inline styles;
+                -- every returned span carries hl = true for the fill.
+                push(marker, "syntax", "")
+                for _, s in ipairs(md_inline(text:sub(inner_start, closer-1), true)) do spans[#spans+1] = s end
+                push(marker, "syntax", "")
+            else
+                local sty = (marker == "**") and "bold" or (marker == "*") and "italic" or "code"
+                push(marker, "syntax", "")
+                if marker == "`" then push(text:sub(inner_start, closer-1), sty)
+                else push_nested(text:sub(inner_start, closer-1), sty) end
+                push(marker, "syntax", "")
+            end
             i = closer + #marker
         else
             buf = buf .. c1; i = i + 1
         end
     end
     push(buf, "normal")
-    if #spans == 0 then spans[1] = { text = "", style = "normal" } end
+    if #spans == 0 then spans[1] = { text = "", style = "normal", hl = hl or nil } end
     return spans
 end
 
@@ -668,7 +819,7 @@ local function schedule_wake_repaint()
         UIManager:setDirty("all", "full")
     end)
 end
-local MDEDIT_PAD = 40
+local MDEDIT_PAD = 24
 local MDEDIT_TOPBAR_H = 56
 local MDEDIT_TOPBAR_GAP = 14
 local MDEDIT_TOOL_MIN_CELL = 72
@@ -682,6 +833,7 @@ local MDEDIT_LINE_HEIGHT = 0.80
 local MDEDIT_LINE_GAP = 0
 local MDEDIT_PARA_GAP = 12
 local MDEDIT_CARET_BLINK = 0.55
+local MDEDIT_CARET_RESUME_DELAY = 0.70
 local MDEDIT_SELECT_PAN_MIN = 18
 local MDEDIT_EDIT_SCROLL_PAN_MIN = 42
 local MDEDIT_PAGE_PAN_MIN = 24   -- min vertical drag (px) that triggers a page turn
@@ -690,10 +842,1087 @@ local MDEDIT_EDIT_DTAP_MOVE = 18
 local MDEDIT_READER_DTAP = 0.25  -- reader double-tap must land within this fast window (also the single-tap page delay)
 local MDEDIT_READER_EDGE = 130   -- reader taps within this many px of the L/R/bottom edge are page-turns, never an exit
 local MDEDIT_AUTOSAVE_DELAY = 1.0
+local MDEDIT_TYPE_FIRST_FLUSH_DELAY = 0.02
+local MDEDIT_TYPE_FLUSH_DELAY = 0.045
+local MDEDIT_TYPE_BURST_IDLE = 0.30
 local MDEDIT_FILE_RELOAD_INTERVAL = 2.0
 local MDEDIT_KEYBOARD_SWIPE_EDGE = 90
 local MDEDIT_KEYBOARD_SWIPE_DY = 35
-local MDEdit = InputContainer:extend{ path = nil, on_close = nil, is_always_active = true }
+-- Hairline gap kept between the last text row and the keyboard's top edge, so the
+-- text can run down into the strip that catches the swipe-to-hide gesture without
+-- sitting flush against the keys.
+local MDEDIT_KBD_TEXT_GAP = 8
+-- Light-gray fill drawn behind ==highlighted== text (distinct from the darker
+-- selection gray, and light enough to keep black text legible on e-ink).
+local MDEDIT_HIGHLIGHT_GRAY = Blitbuffer.Color8(190)
+local MINDMAP_PAD = 34
+local MINDMAP_TOPBAR_H = 56
+local MINDMAP_TOPBAR_GAP = 16
+local MINDMAP_TOPBAR_PAD_X = Size.padding.large
+local MINDMAP_TOPBAR_PAD_RIGHT = Size.padding.small
+-- Match the editor's top framing so mode switches do not shift the chrome.
+local MINDMAP_TOPBAR_TOP_PAD = MDEDIT_PAD
+local MINDMAP_CLOSE_W = Screen:scaleBySize(50)
+local MINDMAP_ACTION_DIVIDER = 1
+local MINDMAP_MENU_TITLE_GAP = Screen:scaleBySize(18)
+local MINDMAP_ACTION_MIN_W = Screen:scaleBySize(64)
+local MINDMAP_EDIT_DTAP = 0.30
+local MINDMAP_EDIT_DTAP_MOVE = 28
+local MINDMAP_WORLD_TOP = 80
+local MINDMAP_WORLD_ROW = 54
+local MINDMAP_LABEL_GAP = 8
+local MINDMAP_NODE_MIN_W = 200
+local MINDMAP_NODE_MAX_W = 560
+local MINDMAP_NODE_TAIL = 110
+local MINDMAP_COLUMN_GAP = 90
+local MINDMAP_NODE_H = 30
+local MINDMAP_TEXT_BOTTOM_PAD = Screen:scaleBySize(5)
+local MINDMAP_TEXT_LINE_TIGHTEN = Screen:scaleBySize(7)
+local MINDMAP_MIN_ZOOM = 0.38
+local MINDMAP_MAX_ZOOM = 2.2
+local MINDMAP_PAN_GESTURE = 70
+local MINDMAP_PAN_STEP = Screen:scaleBySize(100)
+local MINDMAP_PAN_MIN_VISIBLE = Screen:scaleBySize(80)
+
+-- ============================ Native Markdown mindmap ============================
+-- Mirrors the desktop mindmap's forgiving parser: headings, lists, paragraphs,
+-- blockquotes and fenced code blocks all become nodes in one depth stack. The
+-- Kindle view stays native and edits Markdown ranges directly, so the editor and
+-- map share one source of truth and one interpretation.
+local function mindmap_node(kind, text, line, depth, extra)
+    local node = {
+        kind = kind,
+        text = md_trim(text),
+        line = line,
+        depth = depth or 1,
+        children = {},
+    }
+    if extra then for k, v in pairs(extra) do node[k] = v end end
+    return node
+end
+
+local function parse_mindmap(markdown, title)
+    local lines = split_text_lines(tostring(markdown or ""):gsub("\r\n", "\n"))
+    local root = mindmap_node("root", title or "Mindmap", 1, 0)
+    local stack = { { depth = 0, node = root } }
+    local heading_level = 0
+    local i = 1
+
+    local function attach(depth, node)
+        while #stack > 1 and stack[#stack].depth >= depth do table.remove(stack) end
+        local parent = stack[#stack].node
+        node.parent = parent
+        parent.children[#parent.children+1] = node
+        stack[#stack+1] = { depth = depth, node = node }
+    end
+
+    while i <= #lines do
+        local line = lines[i] or ""
+        if md_trim(line) == "" then
+            i = i + 1
+        else
+            local hashes, htext = line:match("^(#{1,6})%s+(.*)$")
+            if hashes then
+                local level = #hashes
+                heading_level = level
+                attach(level, mindmap_node("heading", htext, i, level, { level = level }))
+                i = i + 1
+            else
+                local fence, info = line:match("^%s*(```)(.*)$")
+                if not fence then fence, info = line:match("^%s*(~~~)(.*)$") end
+                if fence then
+                    local marker = fence
+                    local start_line = i
+                    local raw = { line }
+                    i = i + 1
+                    while i <= #lines do
+                        raw[#raw+1] = lines[i]
+                        if lines[i]:match("^%s*" .. marker) then i = i + 1; break end
+                        i = i + 1
+                    end
+                    attach(heading_level + 1, mindmap_node("code", (md_trim(info) ~= "" and ("``` " .. md_trim(info)) or "``` code"), start_line, heading_level + 1, { raw = raw }))
+                elseif line:match("^%s*>") then
+                    local start_line = i
+                    local parts = {}
+                    while i <= #lines and (lines[i] or ""):match("^%s*>") do
+                        parts[#parts+1] = (lines[i] or ""):gsub("^%s*>%s?", "")
+                        i = i + 1
+                    end
+                    attach(heading_level + 1, mindmap_node("quote", md_trim(table.concat(parts, " ")) ~= "" and table.concat(parts, " ") or "Quote", start_line, heading_level + 1))
+                else
+                    local indent, marker, rest = line:match("^(%s*)([-*+]%s+)(.*)$")
+                    local ordered = false
+                    if not marker then
+                        indent, marker, rest = line:match("^(%s*)(%d+[.)]%s+)(.*)$")
+                        ordered = marker ~= nil
+                    end
+                    if marker then
+                        local nindent = #(tostring(indent or ""):gsub("\t", "  "))
+                        local depth = heading_level + 1 + math.floor(nindent / 2)
+                        local task, body = rest:match("^(%[[ xX]%]%s+)(.*)$")
+                        attach(depth, mindmap_node("list", task and body or rest, i, depth, {
+                            marker = marker,
+                            ordered = ordered,
+                            task = task,
+                        }))
+                        i = i + 1
+                    else
+                        local start_line = i
+                        local parts = {}
+                        while i <= #lines do
+                            local l = lines[i] or ""
+                            if md_trim(l) == "" then break end
+                            if l:match("^(#{1,6})%s+") or l:match("^%s*[-*+]%s+") or l:match("^%s*%d+[.)]%s+")
+                                or l:match("^%s*>") or l:match("^%s*```") or l:match("^%s*~~~") then break end
+                            parts[#parts+1] = l
+                            i = i + 1
+                        end
+                        attach(heading_level + 1, mindmap_node("paragraph", table.concat(parts, "\n"), start_line, heading_level + 1))
+                    end
+                end
+            end
+        end
+    end
+
+    if #root.children == 0 then
+        root.children[1] = mindmap_node("heading", "Mindmap", 1, 1, { level = 1, parent = root })
+    end
+    return root
+end
+
+local MindmapCanvas = Widget:extend{}
+function MindmapCanvas:getSize() return self.dimen end
+function MindmapCanvas:paintTo(bb, x, y)
+    local map = self.map
+    local w, h = self.dimen.w, self.dimen.h
+    bb:paintRect(x, y, w, h, Blitbuffer.COLOR_WHITE)
+    local function px(v) return math.floor(x + map.pan_x + v * map.zoom) end
+    local function py(v) return math.floor(y + map.pan_y + v * map.zoom) end
+    local function rect(rx, ry, rw, rh, color)
+        local x0, y0, x1, y1 = math.max(x, rx), math.max(y, ry), math.min(x + w, rx + rw), math.min(y + h, ry + rh)
+        if x1 > x0 and y1 > y0 then bb:paintRect(x0, y0, x1 - x0, y1 - y0, color) end
+    end
+    -- E-ink has no inexpensive anti-aliased path primitive. Clean elbows aligned
+    -- to each node's visible rule read better than a stepped faux curve.
+    for _, entry in ipairs(map.visual_nodes or {}) do
+        local node = entry.node
+        if node.parent and node.parent.mx then
+            local p, n = node.parent, node
+            local x1, y1 = px(p.mx + p.mw), py(p.my + p.mh)
+            local x2, y2 = px(n.mx), py(n.my + n.mh)
+            if not (math.max(x1, x2) < x or math.min(x1, x2) > x + w or math.max(y1, y2) < y or math.min(y1, y2) > y + h) then
+                local stroke = math.max(1, math.floor(map.zoom))
+                local mid = math.floor((x1 + x2) / 2)
+                local color = Blitbuffer.Color8(105)
+                rect(math.min(x1, mid), y1 - stroke, math.abs(mid - x1) + stroke, stroke, color)
+                rect(mid - stroke, math.min(y1, y2), stroke, math.abs(y2 - y1) + stroke, color)
+                rect(math.min(mid, x2), y2 - stroke, math.abs(x2 - mid) + stroke, stroke, color)
+            end
+        end
+    end
+    for _, entry in ipairs(map.visual_nodes or {}) do
+        local n = entry.node
+        local nx, ny = px(n.mx), py(n.my)
+        local nw, nh = math.max(2, math.floor(n.mw * map.zoom)), math.max(2, math.floor(n.mh * map.zoom))
+        local selected = entry.index == map.selected
+        local style = n.kind == "root" and "h1" or map:nodeStyle(n)
+        if nx + nw >= x and nx <= x + w and ny + nh >= y and ny <= y + h and nw > 22 and nh > 12 then
+            local face = md_face(style, math.max(0.45, map.scale * map.zoom))
+            local lines = (selected and map.editing_index == entry.index and map.edit_lines) or n.mlines or { map:nodeText(n) }
+            local ty = ny + 1
+            local edit_cursor, chars_before, cursor_drawn = selected and map.editing_index == entry.index and map.edit_col, 0, false
+            for line_i, text in ipairs(lines) do
+                local tw = TextWidget:new{ text = text, face = face, fgcolor = md_color(style) }
+                local ts = tw:getSize()
+                -- TextWidget paints directly into the BlitBuffer and does not
+                -- safely clip negative/off-edge coordinates. Nodes can straddle
+                -- the viewport while panning, so only paint fully visible text.
+                if nx >= x and nx + ts.w <= x + w and ty >= y and ty + ts.h <= y + h then
+                    tw:paintTo(bb, nx, ty)
+                end
+                if edit_cursor and map.caret_on and not cursor_drawn and (edit_cursor <= chars_before + #text or line_i == #lines) then
+                    local col = math.max(0, math.min(#text, edit_cursor - chars_before))
+                    local caret_x = nx + map:textw(text:sub(1, col), face)
+                    rect(caret_x, ty, math.max(2, math.floor(map.zoom * 2)), ts.h, Blitbuffer.COLOR_BLACK)
+                    map.caret_region = Geom:new{ x = caret_x, y = ty, w = math.max(2, math.floor(map.zoom * 2)), h = ts.h }
+                    cursor_drawn = true
+                end
+                chars_before = chars_before + #text + 1
+                if line_i < #lines then
+                    ty = ty + math.max(1, ts.h - MINDMAP_TEXT_LINE_TIGHTEN)
+                end
+                tw:free()
+            end
+        end
+        -- The only node chrome is its terminator line, matching Minfolio's map.
+        local line_y = ny + nh - math.max(1, math.floor(map.zoom))
+        rect(nx, line_y, nw, selected and math.max(4, math.floor(map.zoom * 3)) or math.max(1, math.floor(map.zoom)), selected and Blitbuffer.COLOR_BLACK or Blitbuffer.Color8(105))
+    end
+end
+
+local MindmapView = InputContainer:extend{ editor = nil, is_always_active = true, disable_double_tap = true }
+function MindmapView:init()
+    self.fw, self.fh = Screen:getWidth(), Screen:getHeight()
+    self.dimen = Geom:new{ x = 0, y = 0, w = self.fw, h = self.fh }
+    self.scale = self.editor and self.editor.scale or clamp_minfolio_scale(MINFOLIO_STATE.scale)
+    self.parent = self
+    self.path = self.editor and self.editor.path or ""
+    self.root = parse_mindmap(self.editor and self.editor:currentText() or "", path_base(self.path))
+    self.rows, self.selected, self._undo, self.top_zones = {}, 1, {}, {}
+    self.zoom, self.pan_x, self.pan_y = 1, 0, 0
+    self.caret_on, self._map_caret_blinking = true, true
+    self.canvas_y = MINDMAP_TOPBAR_H + MINDMAP_TOPBAR_TOP_PAD + MINDMAP_TOPBAR_GAP
+    if Device:isTouchDevice() then
+        self.ges_events = {
+            Tap = { GestureRange:new{ ges = "tap", range = self.dimen } },
+            Pan = { GestureRange:new{ ges = "pan", range = self.dimen } },
+            PanRelease = { GestureRange:new{ ges = "pan_release", range = self.dimen } },
+            Pinch = { GestureRange:new{ ges = "pinch", range = self.dimen } },
+            Spread = { GestureRange:new{ ges = "spread", range = self.dimen } },
+        }
+    end
+    self:flatten()
+    -- Node height depends on the readable font size at the fitted zoom. A few
+    -- passes converge the map bounds before its first paint.
+    for _ = 1, 3 do
+        self:layoutMap()
+        self:fitMap()
+    end
+    self:rebuild()
+    self:scheduleMapCaretBlink()
+end
+
+function MindmapView:textw(txt, face)
+    if txt == "" then return 0 end
+    local tw = TextWidget:new{ text = txt, face = face }
+    local w = tw:getSize().w; tw:free(); return w
+end
+
+function MindmapView:trimToWidth(text, maxw, face)
+    if self:textw(text, face) <= maxw then return text end
+    local ell, lo, hi, best = "...", 0, #text, "..."
+    while lo <= hi do
+        local mid = math.floor((lo + hi) / 2)
+        local s = text:sub(1, mid) .. ell
+        if self:textw(s, face) <= maxw then best = s; lo = mid + 1 else hi = mid - 1 end
+    end
+    return best
+end
+
+function MindmapView:flatten()
+    local rows = {}
+    local function walk(node, depth)
+        if node.kind ~= "root" then rows[#rows+1] = { node = node, depth = depth } end
+        for _, child in ipairs(node.children or {}) do walk(child, depth + 1) end
+    end
+    for _, child in ipairs(self.root.children or {}) do walk(child, 0) end
+    local text_lines = split_text_lines(self.editor and self.editor:currentText() or "")
+    for i, entry in ipairs(rows) do
+        local finish = #text_lines
+        for j = i + 1, #rows do if rows[j].depth <= entry.depth then finish = math.max(entry.node.line, rows[j].node.line - 1); break end end
+        entry.finish, entry.node.finish = finish, finish
+    end
+    self.rows = rows
+    self.selected = math.max(1, math.min(self.selected or 1, math.max(1, #rows)))
+end
+
+function MindmapView:nodeStyle(node)
+    if node.kind == "heading" then return "h" .. math.min(3, tonumber(node.level) or 3) end
+    if node.kind == "code" then return "code" end
+    if node.kind == "quote" then return "quote" end
+    if node.kind == "list" then return "bullet" end
+    return "normal"
+end
+
+function MindmapView:nodeText(node)
+    local text = md_trim(node.text)
+    text = text:gsub("^#{1,6}%s+", "")
+    if node.kind == "list" and node.task then text = (node.task:match("%[[xX]%]") and "[x] " or "[ ] ") .. text end
+    if node.kind == "paragraph" then text = text:gsub("%s*\n%s*", " ") end
+    local plain = {}
+    for _, span in ipairs(md_inline(text)) do
+        if span.style ~= "syntax" then plain[#plain+1] = span.display or span.text or "" end
+    end
+    text = table.concat(plain)
+    return text ~= "" and text or (node.kind == "paragraph" and "Paragraph" or "Untitled")
+end
+
+function MindmapView:mapRegion()
+    return Geom:new{ x = 0, y = self.canvas_y, w = self.fw, h = math.max(1, self.fh - self.canvas_y) }
+end
+
+function MindmapView:mapDirtyTarget()
+    -- The map itself is full-screen while the keyboard is a separate window
+    -- above it. Repainting only the map would erase the keyboard's pixels
+    -- without repainting that top layer.
+    return self.keyboard and "all" or self
+end
+
+function MindmapView:scheduleMapCaretBlink()
+    UIManager:scheduleIn(MDEDIT_CARET_BLINK, function()
+        if not self._map_caret_blinking then return end
+        if self.editing_index then
+            self.caret_on = not self.caret_on
+            UIManager:setDirty(self:mapDirtyTarget(), "ui", self.caret_region or self:mapRegion())
+        else
+            self.caret_on = false
+        end
+        self:scheduleMapCaretBlink()
+    end)
+end
+
+function MindmapView:layoutMap()
+    local max_width_by_depth, max_depth = {}, 0
+    local function measure(node)
+        local style = node.kind == "root" and "h1" or self:nodeStyle(node)
+        local text = node.kind == "root" and node.text or (node._edit_text or self:nodeText(node))
+        local face = md_face(style, self.scale)
+        local text_limit = MINDMAP_NODE_MAX_W - MINDMAP_NODE_TAIL
+        node.mw = math.max(MINDMAP_NODE_MIN_W, math.min(MINDMAP_NODE_MAX_W, self:textw(text, face) + MINDMAP_NODE_TAIL))
+        node.mlines = self:wrapNodeText(text, math.min(text_limit, node.mw - MINDMAP_NODE_TAIL), face)
+        -- The canvas keeps type readable at low zoom (rather than scaling it
+        -- below 0.45). Measure that exact rendered face here, then convert its
+        -- screen height back to map coordinates. This keeps wrapped labels above
+        -- their fixed terminator line instead of letting text paint through it.
+        local render_scale = math.max(0.45, self.scale * self.zoom)
+        local probe = TextWidget:new{ text = "Hg", face = md_face(style, render_scale) }
+        local line_h = probe:getSize().h; probe:free()
+        local line_step = math.max(1, line_h - MINDMAP_TEXT_LINE_TIGHTEN)
+        local text_h = line_h + math.max(0, #node.mlines - 1) * line_step
+        node.mh = math.max(MINDMAP_NODE_H, math.ceil((text_h + MINDMAP_TEXT_BOTTOM_PAD) / self.zoom))
+        node._map_depth = node._map_depth or 0
+        max_depth = math.max(max_depth, node._map_depth)
+        max_width_by_depth[node._map_depth] = math.max(max_width_by_depth[node._map_depth] or 0, node.mw)
+        for _, child in ipairs(node.children or {}) do child._map_depth = node._map_depth + 1; measure(child) end
+    end
+    self.root._map_depth = 0
+    measure(self.root)
+    local column_x, x = {}, 0
+    for depth = 0, max_depth do
+        column_x[depth] = x
+        x = x + (max_width_by_depth[depth] or MINDMAP_NODE_MIN_W) + MINDMAP_COLUMN_GAP
+    end
+    local leaf_count, last_leaf_baseline = 0, nil
+    local function place(node, depth)
+        node.mx = column_x[depth] or 0
+        if #node.children == 0 then
+            local nominal = MINDMAP_WORLD_TOP + leaf_count * MINDMAP_WORLD_ROW
+            -- Labels are bottom-aligned to their terminator line. Expand only
+            -- the following branch's gap when its upward-growing label needs it.
+            node.baseline = last_leaf_baseline and math.max(
+                nominal, last_leaf_baseline + node.mh + MINDMAP_LABEL_GAP
+            ) or nominal
+            node.my = node.baseline - node.mh
+            last_leaf_baseline = node.baseline
+            leaf_count = leaf_count + 1
+        else
+            for _, child in ipairs(node.children) do place(child, depth + 1) end
+            node.baseline = (node.children[1].baseline + node.children[#node.children].baseline) / 2
+            node.my = node.baseline - node.mh
+        end
+    end
+    place(self.root, 0)
+
+    -- Long parent labels can still collide with a neighbouring parent despite
+    -- their children being clear. Resolve those collisions per depth, moving an
+    -- entire branch so its internal connector geometry stays intact.
+    local by_depth = {}
+    local function collect(node)
+        local nodes = by_depth[node._map_depth] or {}
+        nodes[#nodes + 1] = node
+        by_depth[node._map_depth] = nodes
+        for _, child in ipairs(node.children) do collect(child) end
+    end
+    local function shift_branch(node, delta)
+        node.baseline, node.my = node.baseline + delta, node.my + delta
+        for _, child in ipairs(node.children) do shift_branch(child, delta) end
+    end
+    local function settle_parents(node)
+        if #node.children > 0 then
+            for _, child in ipairs(node.children) do settle_parents(child) end
+            node.baseline = (node.children[1].baseline + node.children[#node.children].baseline) / 2
+            node.my = node.baseline - node.mh
+        end
+    end
+    collect(self.root)
+    for depth = max_depth, 1, -1 do
+        local previous
+        for _, node in ipairs(by_depth[depth] or {}) do
+            if previous then
+                local delta = previous.baseline + MINDMAP_LABEL_GAP - node.my
+                if delta > 0 then shift_branch(node, delta) end
+            end
+            previous = node
+        end
+        settle_parents(self.root)
+    end
+    self.visual_nodes = { { index = 0, node = self.root } }
+    for i, entry in ipairs(self.rows) do self.visual_nodes[#self.visual_nodes+1] = { index = i, node = entry.node } end
+    self.world_w = math.max(MINDMAP_NODE_MIN_W, x - MINDMAP_COLUMN_GAP)
+    local bottom = MINDMAP_WORLD_TOP
+    for _, entry in ipairs(self.visual_nodes) do bottom = math.max(bottom, entry.node.baseline) end
+    self.world_h = math.max(MINDMAP_NODE_H, bottom + MINDMAP_WORLD_ROW)
+end
+
+function MindmapView:wrapNodeText(text, maxw, face)
+    local lines, line = {}, ""
+    for word in tostring(text or ""):gmatch("%S+") do
+        local candidate = line == "" and word or (line .. " " .. word)
+        if line ~= "" and self:textw(candidate, face) > maxw then
+            lines[#lines+1], line = line, word
+        else
+            line = candidate
+        end
+    end
+    if line ~= "" then lines[#lines+1] = line end
+    return #lines > 0 and lines or { "Untitled" }
+end
+
+function MindmapView:nodeAt(pos)
+    if not pos then return nil end
+    local wx = (pos.x - MINDMAP_PAD - self.pan_x) / self.zoom
+    local wy = (pos.y - self.canvas_y - self.pan_y) / self.zoom
+    local root = self.root
+    if root and wx >= root.mx and wx <= root.mx + root.mw and wy >= root.my and wy <= root.my + root.mh then return 0 end
+    for i, entry in ipairs(self.rows or {}) do
+        local n = entry.node
+        if wx >= n.mx and wx <= n.mx + n.mw and wy >= n.my and wy <= n.my + n.mh then return i end
+    end
+end
+
+function MindmapView:linePrefix(line)
+    local prefix = line:match("^(#{1,6}%s+)") or line:match("^(%s*>%s?)")
+    if prefix then return prefix end
+    local indent, marker, body = line:match("^(%s*)([-*+]%s+)(.*)$")
+    if not marker then indent, marker, body = line:match("^(%s*)(%d+[.)]%s+)(.*)$") end
+    if marker then return (indent or "") .. marker .. ((body or ""):match("^(%[[ xX]%]%s+)") or "") end
+    return ""
+end
+
+function MindmapView:showMapKeyboard()
+    if self.keyboard or not Device:isTouchDevice() then return end
+    local VirtualKeyboard = require("ui/widget/virtualkeyboard")
+    local keyboard = VirtualKeyboard:new{ inputbox = self }
+    keyboard.modal = false
+    self.keyboard = keyboard
+    local map, original_close = self, keyboard.onCloseWidget
+    function keyboard:onCloseWidget()
+        if original_close then original_close(self) end
+        if map.keyboard == self then map.keyboard = nil; map:refresh() end
+    end
+    UIManager:show(keyboard)
+end
+
+function MindmapView:hideMapKeyboard()
+    if not self.keyboard then return end
+    local keyboard = self.keyboard
+    self.keyboard = nil
+    UIManager:close(keyboard)
+end
+
+function MindmapView:beginNodeEdit(index)
+    local entry = self.rows and self.rows[index]
+    if not entry or not self.editor then return end
+    self.selected = index
+    local line = (split_text_lines(self.editor:currentText()))[entry.node.line] or ""
+    self.editing_index, self.edit_line = index, entry.node.line
+    self.caret_on = true
+    self.edit_prefix = self:linePrefix(line)
+    self.edit_text, self.edit_col = line:sub(#self.edit_prefix + 1), #line - #self.edit_prefix
+    entry.node._edit_text = self.edit_text
+    self.edit_lines = self:wrapNodeText(self.edit_text, MINDMAP_NODE_MAX_W - MINDMAP_NODE_TAIL, md_face(self:nodeStyle(entry.node), self.scale))
+    self:layoutMap()
+    self:showMapKeyboard()
+    self:refresh()
+end
+
+function MindmapView:updateEditLayout()
+    local entry = self:selectedEntry()
+    if entry then
+        entry.node._edit_text = self.edit_text
+        self.edit_lines = self:wrapNodeText(self.edit_text, MINDMAP_NODE_MAX_W - MINDMAP_NODE_TAIL, md_face(self:nodeStyle(entry.node), self.scale))
+        self:layoutMap()
+    end
+    self:refresh()
+end
+
+function MindmapView:commitNodeEdit()
+    if not self.editing_index or not self.editor then return false end
+    local line, prefix = self.edit_line, self.edit_prefix
+    local text = tostring(self.edit_text or ""):gsub("[\r\n]+", " ")
+    local lines = split_text_lines(self.editor:currentText())
+    local changed = lines[line] ~= (prefix .. text)
+    local entry = self.rows and self.rows[self.editing_index]
+    if entry then entry.node._edit_text = nil end
+    self.editing_index, self.edit_line, self.edit_prefix, self.edit_text, self.edit_lines = nil, nil, nil, nil, nil
+    self.caret_on, self.caret_region = false, nil
+    self:hideMapKeyboard()
+    if changed then
+        self:snapshot()
+        lines[line] = prefix .. text
+        self:applyLines(lines, line)
+    else
+        self:refresh()
+    end
+    return true
+end
+
+function MindmapView:cancelNodeEdit()
+    if not self.editing_index then return end
+    local entry = self.rows and self.rows[self.editing_index]
+    if entry then entry.node._edit_text = nil end
+    self.editing_index, self.edit_line, self.edit_prefix, self.edit_text, self.edit_lines = nil, nil, nil, nil, nil
+    self.caret_on, self.caret_region = false, nil
+    self:layoutMap()
+    self:hideMapKeyboard()
+    self:refresh()
+end
+
+-- VirtualKeyboard inputbox interface for the in-place node editor.
+function MindmapView:addChars(chars)
+    if not self.editing_index then return end
+    local before, after = self.edit_text:sub(1, self.edit_col), self.edit_text:sub(self.edit_col + 1)
+    self.edit_text = before .. tostring(chars or "") .. after
+    self.edit_col = #before + #(tostring(chars or ""))
+    self:updateEditLayout()
+end
+function MindmapView:delChar()
+    if self.editing_index and self.edit_col > 0 then
+        local start = utf8_left(self.edit_text, self.edit_col)
+        self.edit_text, self.edit_col = self.edit_text:sub(1, start) .. self.edit_text:sub(self.edit_col + 1), start
+        self:updateEditLayout()
+    end
+end
+function MindmapView:delWord()
+    if not self.editing_index then return end
+    local start, old = prev_word_col(self.edit_text, self.edit_col), self.edit_col
+    self.edit_text, self.edit_col = self.edit_text:sub(1, start) .. self.edit_text:sub(old + 1), start
+    self:updateEditLayout()
+end
+function MindmapView:delToStartOfLine() if self.editing_index then self.edit_text = self.edit_text:sub(self.edit_col + 1); self.edit_col = 0; self:updateEditLayout() end end
+function MindmapView:leftChar() if self.editing_index then self.edit_col = utf8_left(self.edit_text, self.edit_col); self:updateEditLayout() end end
+function MindmapView:rightChar() if self.editing_index then self.edit_col = utf8_right(self.edit_text, self.edit_col); self:updateEditLayout() end end
+function MindmapView:goToStartOfLine() if self.editing_index then self.edit_col = 0; self:updateEditLayout() end end
+function MindmapView:goToEndOfLine() if self.editing_index then self.edit_col = #self.edit_text; self:updateEditLayout() end end
+function MindmapView:upLine() end
+function MindmapView:downLine() end
+function MindmapView:scrollUp() end
+function MindmapView:scrollDown() end
+function MindmapView:onSwitchingKeyboardLayout() end
+
+function MindmapView:fitMap()
+    local vw, vh = self.fw - (MINDMAP_PAD * 2), self.fh - self.canvas_y - MINDMAP_PAD
+    self.zoom = math.max(MINDMAP_MIN_ZOOM, math.min(1.0, vw / (self.world_w + 40), vh / (self.world_h + 40)))
+    self.pan_x = math.floor((vw - self.world_w * self.zoom) / 2)
+    self.pan_y = math.floor((vh - self.world_h * self.zoom) / 2)
+end
+
+function MindmapView:clampPan()
+    local vw, vh = self.fw - (MINDMAP_PAD * 2), self.fh - self.canvas_y - MINDMAP_PAD
+    local map_w, map_h = self.world_w * self.zoom, self.world_h * self.zoom
+    -- Fitted maps must still be movable. The bounds retain a small visible
+    -- slice of content instead of re-centering a map merely because it fits.
+    local visible_w = math.min(MINDMAP_PAN_MIN_VISIBLE, map_w)
+    local visible_h = math.min(MINDMAP_PAN_MIN_VISIBLE, map_h)
+    self.pan_x = math.max(visible_w - map_w, math.min(vw - visible_w, self.pan_x))
+    self.pan_y = math.max(visible_h - map_h, math.min(vh - visible_h, self.pan_y))
+end
+
+function MindmapView:topBar(cw)
+    local title_face = Font:getFace("cfont", 22)
+    local action_face = Font:getFace("cfont", 19)
+    local raw_title = (path_base(self.path) ~= "" and path_base(self.path) or "Mindmap")
+    local labels = {
+        { name = "add", text = "Add" },
+        { name = "delete", text = "Del" },
+        { name = "undo", text = "Undo" },
+        { name = "edit", text = "Edit" },
+        { name = "close", icon = "close" },
+    }
+    local action_total = 0
+    for _, item in ipairs(labels) do
+        item.w = item.icon and MINDMAP_CLOSE_W or math.max(MINDMAP_ACTION_MIN_W, self:textw(item.text, action_face) + 28)
+        action_total = action_total + item.w
+    end
+    action_total = action_total + ((#labels - 1) * MINDMAP_ACTION_DIVIDER)
+    local max_title_w = math.max(60, cw - MDEDIT_MENU_W - MINDMAP_MENU_TITLE_GAP - action_total - MDEDIT_TITLE_ACTION_GAP)
+    local title = self:trimToWidth(raw_title, max_title_w, title_face)
+    local title_w = self:textw(title, title_face)
+    local gap_w = math.max(MDEDIT_TITLE_ACTION_GAP, cw - MDEDIT_MENU_W - MINDMAP_MENU_TITLE_GAP - title_w - action_total)
+    local x = MDEDIT_MENU_W + MINDMAP_MENU_TITLE_GAP
+    self.top_zones.menu = { x0 = 0, x1 = MDEDIT_MENU_W }
+    x = x + title_w + gap_w
+    local actions = {}
+    for i, item in ipairs(labels) do
+        if i > 1 then
+            actions[#actions+1] = CenterContainer:new{ dimen = Geom:new{ w = MINDMAP_ACTION_DIVIDER, h = MINDMAP_TOPBAR_H },
+                LineWidget:new{ background = Blitbuffer.Color8(210), dimen = Geom:new{ w = MINDMAP_ACTION_DIVIDER, h = math.floor(MINDMAP_TOPBAR_H * 0.46) } }
+            }
+            x = x + MINDMAP_ACTION_DIVIDER
+        end
+        self.top_zones[item.name] = { x0 = x, x1 = x + item.w }
+        actions[#actions+1] = CenterContainer:new{ dimen = Geom:new{ w = item.w, h = MINDMAP_TOPBAR_H },
+            item.icon and IconWidget:new{ icon = item.icon, width = Screen:scaleBySize(29), height = Screen:scaleBySize(29) }
+                or TextWidget:new{ text = item.text, face = action_face, fgcolor = Blitbuffer.COLOR_BLACK } }
+        x = x + item.w
+    end
+    local content = HorizontalGroup:new{ align = "center",
+        CenterContainer:new{ dimen = Geom:new{ w = MDEDIT_MENU_W, h = MINDMAP_TOPBAR_H },
+            IconWidget:new{ icon = "appbar.menu", width = Screen:scaleBySize(24), height = Screen:scaleBySize(24) } },
+        HorizontalSpan:new{ width = MINDMAP_MENU_TITLE_GAP },
+        CenterContainer:new{ dimen = Geom:new{ w = title_w, h = MINDMAP_TOPBAR_H },
+            TextWidget:new{ text = title, face = title_face, fgcolor = Blitbuffer.Color8(110) } },
+        HorizontalSpan:new{ width = gap_w },
+        HorizontalGroup:new(actions),
+    }
+    local padded = HorizontalGroup:new{ align = "center",
+        HorizontalSpan:new{ width = MINDMAP_TOPBAR_PAD_X }, content,
+        HorizontalSpan:new{ width = MINDMAP_TOPBAR_PAD_RIGHT } }
+    return CenterContainer:new{ dimen = Geom:new{ w = cw + MINDMAP_TOPBAR_PAD_X + MINDMAP_TOPBAR_PAD_RIGHT, h = MINDMAP_TOPBAR_H + MINDMAP_TOPBAR_TOP_PAD }, padded }
+end
+
+function MindmapView:rebuild()
+    local cw = self.fw - (MINDMAP_PAD * 2)
+    local topbar = self:topBar(self.fw - MINDMAP_TOPBAR_PAD_X - MINDMAP_TOPBAR_PAD_RIGHT)
+    local canvas_h = self.fh - self.canvas_y - MINDMAP_PAD
+    local canvas = MindmapCanvas:new{ map = self, dimen = Geom:new{ w = cw, h = canvas_h } }
+    local vg = VerticalGroup:new{ align = "left", topbar, VerticalSpan:new{ width = MINDMAP_TOPBAR_GAP },
+        CenterContainer:new{ dimen = Geom:new{ w = self.fw, h = canvas_h }, canvas } }
+    self[1] = FrameContainer:new{ background = Blitbuffer.COLOR_WHITE, bordersize = 0, padding = 0,
+        width = self.fw, height = self.fh, vg }
+end
+
+function MindmapView:refresh(region)
+    self:rebuild()
+    UIManager:setDirty(self:mapDirtyTarget(), "ui", region or self:mapRegion())
+end
+
+function MindmapView:selectedEntry()
+    return self.rows and self.rows[self.selected or 1] or nil
+end
+
+function MindmapView:reloadFromEditor(keep_line)
+    self.root = parse_mindmap(self.editor and self.editor:currentText() or "", path_base(self.path))
+    self:flatten()
+    self:layoutMap()
+    if keep_line then
+        for i, entry in ipairs(self.rows) do
+            if entry.node.line and entry.node.line >= keep_line then
+                self.selected = i
+                break
+            end
+        end
+    end
+end
+
+function MindmapView:snapshot()
+    if not self.editor then return end
+    self._undo[#self._undo+1] = {
+        text = self.editor:currentText(),
+        selected = self.selected,
+        pan_x = self.pan_x, pan_y = self.pan_y, zoom = self.zoom,
+    }
+    if #self._undo > 80 then table.remove(self._undo, 1) end
+end
+
+function MindmapView:applyLines(lines, keep_line)
+    if not self.editor then return false end
+    local text = table.concat(lines, "\n")
+    self.editor.lines = split_text_lines(text)
+    self.editor.crow = math.max(1, math.min(keep_line or self.editor.crow or 1, #self.editor.lines))
+    self.editor.ccol = math.max(0, math.min(self.editor.ccol or 0, #(self.editor.lines[self.editor.crow] or "")))
+    self.editor.sel = nil
+    self.editor._vrows_dirty = true
+    self.editor:save()
+    self:reloadFromEditor(keep_line)
+    self:refresh()
+    return true
+end
+
+function MindmapView:undo()
+    local snap = self._undo and table.remove(self._undo)
+    if not snap or not self.editor then return notify(_("Nothing to undo")) end
+    self.editor.lines = split_text_lines(snap.text or "")
+    self.editor._vrows_dirty = true
+    self.editor:save()
+    self.selected = snap.selected or 1
+    self.pan_x, self.pan_y, self.zoom = snap.pan_x or 0, snap.pan_y or 0, snap.zoom or self.zoom
+    self:reloadFromEditor()
+    self:refresh()
+end
+
+function MindmapView:rangeFor(index)
+    local entry = self.rows and self.rows[index]
+    if not entry then return nil end
+    return entry.node.line, entry.finish or entry.node.finish or entry.node.line
+end
+
+function MindmapView:siblingRange(index, dir)
+    local entry = self.rows and self.rows[index]
+    if not entry then return nil end
+    local parent = entry.node.parent
+    local candidate
+    for i, row in ipairs(self.rows) do
+        if i ~= index and row.node.parent == parent and (row.depth or 0) == (entry.depth or 0) then
+            if dir < 0 and i < index then candidate = i
+            elseif dir > 0 and i > index then return i end
+        end
+    end
+    return candidate
+end
+
+function MindmapView:lineKind(line)
+    local hashes = line:match("^(#{1,6})%s+")
+    if hashes then return "heading", #hashes end
+    local indent, marker = line:match("^(%s*)([-*+]%s+)")
+    if not marker then indent, marker = line:match("^(%s*)(%d+[.)]%s+)") end
+    if marker then return "list", #(indent or "") end
+    return "paragraph", 0
+end
+
+function MindmapView:adjustRangeDepth(lines, first, finish, dir)
+    for i = first, finish do
+        local line = lines[i] or ""
+        local kind = self:lineKind(line)
+        if kind == "heading" then
+            if dir > 0 then
+                lines[i] = "#" .. line
+            else
+                lines[i] = line:gsub("^#", "", 1)
+            end
+        elseif kind == "list" then
+            if dir > 0 then
+                lines[i] = "  " .. line
+            else
+                lines[i] = line:gsub("^  ", "", 1)
+                if lines[i] == line then lines[i] = line:gsub("^%s", "", 1) end
+            end
+        end
+    end
+end
+
+function MindmapView:addChild()
+    if self.selected == 0 and self.editor then
+        local lines = split_text_lines(self.editor:currentText())
+        self:snapshot()
+        if #lines > 0 and md_trim(lines[#lines] or "") ~= "" then table.insert(lines, "") end
+        table.insert(lines, "# New node")
+        return self:applyLines(lines, #lines)
+    end
+    local entry = self:selectedEntry()
+    if not entry or not self.editor then return end
+    local first, finish = self:rangeFor(self.selected)
+    local lines = split_text_lines(self.editor:currentText())
+    local line = lines[first] or ""
+    local kind, level = self:lineKind(line)
+    local new_line
+    if kind == "heading" then
+        new_line = string.rep("#", math.min(6, level + 1)) .. " New node"
+    elseif kind == "list" then
+        new_line = string.rep(" ", level + 2) .. "- New node"
+    else
+        new_line = "- New node"
+    end
+    self:snapshot()
+    table.insert(lines, finish + 1, new_line)
+    self:applyLines(lines, finish + 1)
+end
+
+function MindmapView:deleteSelected()
+    local first, finish = self:rangeFor(self.selected)
+    if not first or not self.editor then return end
+    local lines = split_text_lines(self.editor:currentText())
+    self:snapshot()
+    for _ = first, finish do table.remove(lines, first) end
+    if #lines == 0 then lines[1] = "" end
+    self.selected = math.max(1, math.min(self.selected, math.max(1, #self.rows - 1)))
+    self:applyLines(lines, first)
+end
+
+function MindmapView:moveSibling(dir)
+    local other = self:siblingRange(self.selected, dir)
+    if not other or not self.editor then return notify(_("No sibling there")) end
+    local a1, a2 = self:rangeFor(self.selected)
+    local b1, b2 = self:rangeFor(other)
+    local lines = split_text_lines(self.editor:currentText())
+    self:snapshot()
+    if dir < 0 then
+        local block_a, block_b = {}, {}
+        for i = b1, b2 do block_b[#block_b+1] = lines[i] end
+        for i = a1, a2 do block_a[#block_a+1] = lines[i] end
+        for _ = b1, a2 do table.remove(lines, b1) end
+        for i = #block_a, 1, -1 do table.insert(lines, b1, block_a[i]) end
+        for i = #block_b, 1, -1 do table.insert(lines, b1 + #block_a, block_b[i]) end
+        self.selected = other
+        self:applyLines(lines, b1)
+    else
+        local block_a, block_b = {}, {}
+        for i = a1, a2 do block_a[#block_a+1] = lines[i] end
+        for i = b1, b2 do block_b[#block_b+1] = lines[i] end
+        for _ = a1, b2 do table.remove(lines, a1) end
+        for i = #block_b, 1, -1 do table.insert(lines, a1, block_b[i]) end
+        for i = #block_a, 1, -1 do table.insert(lines, a1 + #block_b, block_a[i]) end
+        self.selected = other
+        self:applyLines(lines, a1 + #block_b)
+    end
+end
+
+function MindmapView:reattach(dir)
+    local first, finish = self:rangeFor(self.selected)
+    if not first or not self.editor then return end
+    local lines = split_text_lines(self.editor:currentText())
+    local line = lines[first] or ""
+    local kind, level = self:lineKind(line)
+    if dir < 0 and ((kind == "heading" and level <= 1) or (kind == "list" and level <= 0) or kind == "paragraph") then
+        return notify(_("Cannot outdent this node"))
+    end
+    if dir > 0 and kind == "heading" and level >= 6 then return notify(_("Heading is already deepest")) end
+    self:snapshot()
+    self:adjustRangeDepth(lines, first, finish, dir)
+    self:applyLines(lines, first)
+end
+
+function MindmapView:close()
+    if self.editing_index then self:commitNodeEdit() end
+    self._map_caret_blinking = false
+    UIManager:close(self)
+    if self.editor then self.editor:refresh{ layout_dirty = false, full = true } end
+end
+
+function MindmapView:saveAndClose()
+    if self.editing_index then self:commitNodeEdit() end
+    self._map_caret_blinking = false
+    UIManager:close(self)
+    if self.editor then self.editor:saveAndClose() end
+end
+
+function MindmapView:openControls()
+    show_controls({
+        { text = "Back to editor", callback = function() self:close() end },
+        { text = "Edit selected node", callback = function()
+            local entry = self:selectedEntry()
+            self:jumpTo(entry and entry.node.line)
+        end },
+        { text = "Add child node", keep = true, callback = function() self:addChild() end },
+        { text = "Delete selected branch", keep = true, callback = function() self:deleteSelected() end },
+        { text = "Undo map edit", keep = true, callback = function() self:undo() end },
+        { text = "Move branch up", keep = true, callback = function() self:moveSibling(-1) end },
+        { text = "Move branch down", keep = true, callback = function() self:moveSibling(1) end },
+        { text = "Attach under previous branch", keep = true, callback = function() self:reattach(1) end },
+        { text = "Attach to parent branch", keep = true, callback = function() self:reattach(-1) end },
+        { text = "Zoom in", keep = true, callback = function() self:zoomAt(nil, 1.25) end },
+        { text = "Zoom out", keep = true, callback = function() self:zoomAt(nil, 0.8) end },
+        { text = "Fit map to screen", keep = true, callback = function() self:fitMap(); self:refresh() end },
+        { text = "Text size +", keep = true, callback = function()
+            if self.editor then self.editor:bumpScale(0.1); self.scale = self.editor.scale end
+            self:refresh()
+        end },
+        { text = "Text size -", keep = true, callback = function()
+            if self.editor then self.editor:bumpScale(-0.1); self.scale = self.editor.scale end
+            self:refresh()
+        end },
+        { text = "⟲ Rotate screen", callback = function() rotate_screen_ccw() end },
+    }, function() self:refresh() end)
+end
+
+function MindmapView:jumpTo(line)
+    if self.editor and line then
+        self.editor:setReaderMode(false, line, 0)
+    end
+    self:close()
+end
+
+function MindmapView:onTap(_, ges)
+    local p = ges and ges.pos
+    if not p then return true end
+    if self.editing_index then self:commitNodeEdit() end
+    if p.y < 95 then
+        local x = p.x - MINDMAP_TOPBAR_PAD_X
+        for name, z in pairs(self.top_zones or {}) do
+            if x >= z.x0 and x < z.x1 then
+                if name == "menu" then self:openControls()
+                elseif name == "add" then self:addChild()
+                elseif name == "delete" then self:deleteSelected()
+                elseif name == "undo" then self:undo()
+                elseif name == "edit" then self:close()
+                elseif name == "close" then self:saveAndClose() end
+                return true
+            end
+        end
+        return true
+    end
+    local hit = self:nodeAt(p)
+    if hit ~= nil then
+        local now = now_seconds()
+        local last = self._last_node_tap
+        if hit > 0 and last and last.index == hit and now - last.t < MINDMAP_EDIT_DTAP
+            and math.abs(p.x - last.x) < MINDMAP_EDIT_DTAP_MOVE and math.abs(p.y - last.y) < MINDMAP_EDIT_DTAP_MOVE then
+            self._last_node_tap = nil
+            self:beginNodeEdit(hit)
+        else
+            self.selected = hit
+            self._last_node_tap = { index = hit, x = p.x, y = p.y, t = now }
+            self:refresh()
+        end
+        return true
+    end
+    return true
+end
+
+function MindmapView:onDoubleTap(_, ges)
+    local hit = self:nodeAt(ges and ges.pos)
+    if hit then self:beginNodeEdit(hit) end
+    return true
+end
+
+function MindmapView:onPan(_, ges)
+    local p, sp = ges and ges.pos, ges and ges.start_pos
+    if not p or not sp then return true end
+    local dx, dy = p.x - sp.x, p.y - sp.y
+    local horizontal = math.abs(dx) >= math.abs(dy)
+    local distance = horizontal and dx or dy
+    local steps = math.floor(math.abs(distance) / MINDMAP_PAN_GESTURE)
+    local direction = distance < 0 and -1 or 1
+    local signature = (horizontal and "x" or "y") .. direction
+    if self._pan_signature ~= signature then self._pan_signature, self._pan_moved = signature, false end
+    -- Panning is intentionally coarse, like zoom: one small, predictable move
+    -- per swipe rather than a viewport-sized jump for every gesture update.
+    if steps > 0 and not self._pan_moved then
+        if horizontal then self.pan_x = self.pan_x + direction * MINDMAP_PAN_STEP
+        else self.pan_y = self.pan_y + direction * MINDMAP_PAN_STEP end
+        self:clampPan()
+        self._pan_moved = true
+        self:refresh()
+    end
+    return true
+end
+
+function MindmapView:onPanRelease()
+    self._pan_signature, self._pan_moved = nil, nil
+    return true
+end
+
+function MindmapView:zoomAt(pos, factor)
+    local old = self.zoom
+    local new = math.max(MINDMAP_MIN_ZOOM, math.min(MINDMAP_MAX_ZOOM, old * factor))
+    if new == old then return end
+    local cx = pos and (pos.x - MINDMAP_PAD) or (self.fw - MINDMAP_PAD * 2) / 2
+    local cy = pos and (pos.y - self.canvas_y) or (self.fh - self.canvas_y - MINDMAP_PAD) / 2
+    local wx, wy = (cx - self.pan_x) / old, (cy - self.pan_y) / old
+    self.zoom = new
+    self.pan_x, self.pan_y = cx - wx * new, cy - wy * new
+    self:layoutMap()
+    self:clampPan()
+    self:refresh()
+end
+
+function MindmapView:onPinch(_, ges)
+    self:zoomAt(ges and ges.pos, 1 - math.min(0.35, (ges and ges.distance or 0) / 700))
+    return true
+end
+
+function MindmapView:onSpread(_, ges)
+    self:zoomAt(ges and ges.pos, 1 + math.min(0.5, (ges and ges.distance or 0) / 500))
+    return true
+end
+
+function MindmapView:centerSelected()
+    local entry = self:selectedEntry()
+    if not entry then return end
+    local n = entry.node
+    local vw, vh = self.fw - MINDMAP_PAD * 2, self.fh - self.canvas_y - MINDMAP_PAD
+    self.pan_x = vw / 2 - (n.mx + n.mw / 2) * self.zoom
+    self.pan_y = vh / 2 - (n.my + MINDMAP_NODE_H / 2) * self.zoom
+    self:clampPan()
+end
+
+function MindmapView:onKeyPress(key)
+    local name = key and key.key
+    if not name then return true end
+    local mods = key_mods(key)
+    if self.editing_index then
+        if name == "Backspace" or name == "BackSpace" then self:delChar()
+        elseif name == "Left" then self:leftChar()
+        elseif name == "Right" then self:rightChar()
+        elseif name == "Home" then self:goToStartOfLine()
+        elseif name == "End" then self:goToEndOfLine()
+        elseif name == "Press" or name == "Return" or name == "Enter" then self:commitNodeEdit()
+        elseif name == "Back" or name == "Esc" or name == "Escape" then self:cancelNodeEdit()
+        elseif not shortcut_mod(mods) and #tostring(name) == 1 then self:addChars(name) end
+        return true
+    end
+    if up_key(name) then
+        self.selected = math.max(1, (self.selected or 1) - 1); self:centerSelected(); self:refresh()
+    elseif down_key(name) then
+        self.selected = math.min(#self.rows, (self.selected or 1) + 1); self:centerSelected(); self:refresh()
+    elseif left_key(name) then self:reattach(-1)
+    elseif right_key(name) then self:reattach(1)
+    elseif page_up_key(name) then self:zoomAt(nil, 0.8)
+    elseif page_down_key(name) or name == "Space" or name == "space" or name == " " then self:zoomAt(nil, 1.25)
+    elseif name == "+" or name == "=" then self:zoomAt(nil, 1.25)
+    elseif name == "-" then self:zoomAt(nil, 0.8)
+    elseif tostring(name):lower() == "a" then self:addChild()
+    elseif name == "Backspace" or name == "BackSpace" or name == "Del" or name == "Delete" then self:deleteSelected()
+    elseif shortcut_mod(mods) and tostring(name):lower() == "z" then self:undo()
+    elseif name == "Press" or name == "Return" or name == "Enter" or name == "KP_Enter" then
+        local entry = self:selectedEntry()
+        self:jumpTo(entry and entry.node.line)
+    elseif name == "Back" or name == "Esc" or name == "Escape" then self:close() end
+    return true
+end
+
+function MindmapView:onScreenResize()
+    self.fw, self.fh = Screen:getWidth(), Screen:getHeight()
+    self.dimen = Geom:new{ x = 0, y = 0, w = self.fw, h = self.fh }
+    if self.ges_events then
+        for _, ev in pairs(self.ges_events) do
+            for _, range in ipairs(ev) do range.range = self.dimen end
+        end
+    end
+    self.canvas_y = MINDMAP_TOPBAR_H + MINDMAP_TOPBAR_TOP_PAD + MINDMAP_TOPBAR_GAP
+    self:refresh()
+    return true
+end
+
+-- A remote session is deliberately dormant until the desktop explicitly writes
+-- a descriptor and launches `remote:`. There is no discovery loop or background
+-- connection merely because Minfolio is open.
+MinfolioRemote = {}
+function MinfolioRemote.socket(cfg, timeout)
+    local sock, err = socket.tcp()
+    if not sock then return nil, err end
+    sock:settimeout(timeout or 1)
+    local ok, cerr = sock:connect(cfg.host, cfg.port)
+    if not ok then pcall(function() sock:close() end); return nil, cerr end
+    local ok_ssl, ssl = pcall(require, "ssl")
+    if not ok_ssl then pcall(function() sock:close() end); return nil, "LuaSec missing" end
+    local wrapped, werr = ssl.wrap(sock, { mode = "client", protocol = "any", verify = "none", options = "all" })
+    if not wrapped then pcall(function() sock:close() end); return nil, werr end
+    wrapped:settimeout(timeout or 1)
+    while true do
+        local hs_ok, hs_err = wrapped:dohandshake()
+        if hs_ok then break end
+        if hs_err ~= "wantread" and hs_err ~= "wantwrite" then pcall(function() wrapped:close() end); return nil, hs_err end
+    end
+    local cert = wrapped:getpeercertificate()
+    local fpr = cert and cert:digest("sha256"):lower():gsub(":", "") or nil
+    if not fpr or fpr ~= tostring(cfg.cert_fingerprint or ""):lower():gsub(":", "") then
+        pcall(function() wrapped:close() end); return nil, "desktop certificate pin mismatch"
+    end
+    return wrapped
+end
+
+function MinfolioRemote.sendAll(sock, data)
+    local pos = 1
+    while pos <= #data do
+        local sent, err = sock:send(data, pos)
+        if not sent then return false, err end
+        pos = sent + 1
+    end
+    return true
+end
+
+local MDEdit = InputContainer:extend{ path = nil, remote = nil, on_close = nil, is_always_active = true }
 function MDEdit:init()
     install_keyboard_aliases()
     self.fw, self.fh = Screen:getWidth(), Screen:getHeight()
@@ -710,6 +1939,9 @@ function MDEdit:init()
     self.reader_mode = false
     local text = read_file(self.path) or ""
     self.lines = split_text_lines(text)
+    -- The editor never owns a socket. A separate process does TLS and leaves
+    -- only local, atomically-written files for this widget to consume.
+    self.remote_revision = self.remote and tonumber(self.remote.revision) or 0
     self._file_signature = file_signature(self.path)
     self._file_text = text
     self.crow, self.ccol, self.top, self.vtop = 1, 0, 1, 1
@@ -718,6 +1950,7 @@ function MDEdit:init()
             Tap       = { GestureRange:new{ ges = "tap",        range = self.dimen } },
             DoubleTap = { GestureRange:new{ ges = "double_tap", range = self.dimen } },
             Pan       = { GestureRange:new{ ges = "pan",        range = self.dimen } },
+            PanRelease= { GestureRange:new{ ges = "pan_release", range = self.dimen } },
             Swipe     = { GestureRange:new{ ges = "swipe",      range = self.dimen } },
             Hold      = { GestureRange:new{ ges = "hold",       range = self.dimen } },
         }
@@ -730,7 +1963,11 @@ function MDEdit:init()
         end
     end
     self:rebuild()
-    self:scheduleCaretBlink()
+    -- A first full draw is still settling when this widget is opened from the
+    -- file browser.  Do not let the caret's tiny partial redraw race it: on an
+    -- e-ink screen that can preserve a blank patch from the browser instead of
+    -- the newly-built editor beneath it.
+    self:scheduleCaretBlink(MDEDIT_CARET_RESUME_DELAY)
     self:scheduleFilePoll()
 end
 -- a thin caret bar that sits between styled spans without disturbing them
@@ -738,8 +1975,14 @@ function MDEdit:caret(h)
     return LineWidget:new{ background = Blitbuffer.COLOR_BLACK,
         dimen = Geom:new{ w = 3, h = h or math.floor(32 * self.scale) } }
 end
-function MDEdit:scheduleCaretBlink()
-    UIManager:scheduleIn(MDEDIT_CARET_BLINK, function()
+function MDEdit:scheduleCaretBlink(delay)
+    if self._caret_blink_pending then
+        UIManager:unschedule(self._caret_blink_pending)
+        self._caret_blink_pending = nil
+    end
+    local fn
+    fn = function()
+        if self._caret_blink_pending == fn then self._caret_blink_pending = nil end
         if not self._caret_blinking then return end
         if self.reader_mode then
             self.caret_on = false
@@ -767,7 +2010,18 @@ function MDEdit:scheduleCaretBlink()
         end
         if dirty_full or region then UIManager:setDirty(self, "ui", region) end
         self:scheduleCaretBlink()
-    end)
+    end
+    self._caret_blink_pending = fn
+    UIManager:scheduleIn(delay or MDEDIT_CARET_BLINK, fn)
+end
+-- Keep a solid caret throughout an input burst. Besides being easier to follow,
+-- this prevents the blink timer from doing a second full widget rebuild while a
+-- typing repaint is already in flight. Each key resets the idle countdown; the
+-- first post-input blink happens only after the burst has settled.
+function MDEdit:pauseCaretBlinkForInput()
+    if not self._caret_blinking or self.reader_mode then return end
+    self.caret_on = true
+    self:scheduleCaretBlink(MDEDIT_CARET_RESUME_DELAY)
 end
 function MDEdit:textw(txt, face)        -- measured rendered width of a string
     if txt == "" then return 0 end
@@ -851,7 +2105,7 @@ function MDEdit:menuGlyph()
     return CenterContainer:new{ dimen = Geom:new{ w = MDEDIT_MENU_W, h = MDEDIT_TOPBAR_H },
         IconWidget:new{ icon = "appbar.menu", width = Screen:scaleBySize(24), height = Screen:scaleBySize(24) } }
 end
-function MDEdit:topBar(cw)
+function MDEdit:buildTopBar(cw)
     local title_face = Font:getFace("cfont", 22)
     local raw_title = self.path:match("[^/]+$") or "note"
     self.top_zones = {}
@@ -902,7 +2156,7 @@ function MDEdit:topBar(cw)
             x = x + MDEDIT_TOOL_DIVIDER
         end
         self.top_zones[tool_names[i]] = { x0 = x, x1 = x + tool_cell_w }
-        local glyph_tool = i == 6 or i == 7   -- checkbox + reader glyphs render from cfont
+        local glyph_tool = i == 6 or i == 8   -- checkbox + reader glyphs render from cfont
         tool_widgets[#tool_widgets+1] = self:toolCell(lbl, glyph_tool and "cfont" or "tfont", glyph_tool and 24 or 23, tool_cell_w)
         x = x + tool_cell_w
     end
@@ -916,6 +2170,20 @@ function MDEdit:topBar(cw)
         self:toolDivider(),
         self:toolCell("\226\156\149", "cfont", 30, tool_cell_w),
     }
+end
+-- The toolbar/title subtree is static during typing, yet rebuilding it shapes the
+-- same title and eight tool glyphs again for every input flush and caret blink.
+-- Reuse it until width or mode changes; keep the matching hit zones with it.
+function MDEdit:topBar(cw)
+    local key = table.concat({ tostring(cw), self.reader_mode and "reader" or "edit" }, "|")
+    local cached = self._topbar_cache
+    if cached and cached.key == key then
+        self.top_zones = cached.zones
+        return cached.widget
+    end
+    local widget = self:buildTopBar(cw)
+    self._topbar_cache = { key = key, widget = widget, zones = self.top_zones }
+    return widget
 end
 function MDEdit:pointToCursor(pos)
     if not pos then return self.crow, self.ccol end
@@ -1031,7 +2299,7 @@ function MDEdit:layoutLine(toks, availw)
         if display == nil then display = raw end
         if display ~= raw then
             local uw = display ~= "" and self:wordw(display, span.style) or 0
-            row.segs[#row.segs+1] = { text = raw, display = display, style = span.style, w = uw, sb = byte }
+            row.segs[#row.segs+1] = { text = raw, display = display, style = span.style, hl = span.hl, w = uw, sb = byte }
             row.w = row.w + uw; byte = byte + #raw
         else
             local pos = 1
@@ -1041,7 +2309,7 @@ function MDEdit:layoutLine(toks, availw)
                 if not unit:match("^%s") and #row.segs > 0 and row.w + uw > availw then
                     rows[#rows+1] = row; row = newRow(hanging, byte)
                 end
-                row.segs[#row.segs+1] = { text = unit, display = unit, style = span.style, w = uw, sb = byte }
+                row.segs[#row.segs+1] = { text = unit, display = unit, style = span.style, hl = span.hl, w = uw, sb = byte }
                 row.w = row.w + uw; byte = byte + #unit; pos = pos + #unit
             end
         end
@@ -1073,42 +2341,72 @@ function MDEdit:renderRow(row)
     row._rendered, row._rendered_scale = hg, self.scale
     return hg
 end
--- Greedy word-wrap of a table cell into lines that each fit `maxw` px. Words
--- longer than a column are hard-broken on UTF-8 boundaries so nothing is lost.
-function MDEdit:wrapCellText(text, style, maxw)
-    text = tostring(text or "")
-    local face = md_face(style, self.scale)
-    if text == "" then return { "" } end
-    if self:textw(text, face) <= maxw then return { text } end
-    local lines, cur = {}, ""
-    for word in text:gmatch("%S+") do
-        local candidate = cur == "" and word or (cur .. " " .. word)
-        if self:textw(candidate, face) <= maxw then
-            cur = candidate
-        else
-            if cur ~= "" then lines[#lines+1] = cur; cur = "" end
-            if self:textw(word, face) <= maxw then
-                cur = word
-            else
-                local w = word                          -- hard-break an over-long word
-                while w ~= "" do
-                    local i, prefix = 0, ""
-                    while true do
-                        local nxt = utf8_right(w, i)
-                        if nxt == i then break end
-                        if self:textw(w:sub(1, nxt), face) <= maxw then prefix = w:sub(1, nxt); i = nxt
-                        else break end
-                    end
-                    if prefix == "" then prefix = w:sub(1, math.max(1, utf8_right(w, 0))) end
-                    lines[#lines+1] = prefix
-                    w = w:sub(#prefix + 1)
-                end
+function MDEdit:tableInlineSpans(text, base_style)
+    local spans = {}
+    for _, span in ipairs(md_inline(tostring(text or ""))) do
+        if span.style ~= "syntax" then
+            local style = span.style == "normal" and base_style or span.style
+            local display = span.display == nil and span.text or span.display
+            if display ~= "" then
+                spans[#spans+1] = { text = display, display = display, style = style, hl = span.hl }
             end
         end
     end
-    if cur ~= "" then lines[#lines+1] = cur end
-    if #lines == 0 then lines[1] = "" end
-    return lines
+    return spans
+end
+function MDEdit:tableInlineWidth(text, base_style)
+    local width = 0
+    for _, span in ipairs(self:tableInlineSpans(text, base_style)) do
+        width = width + self:wordw(span.display or span.text or "", span.style)
+    end
+    return width
+end
+-- Inline-aware greedy wrapping for table cells. Markdown markers have already
+-- been removed by tableInlineSpans, while each visible run retains its face and
+-- highlight flag. Over-long words are still hard-broken on UTF-8 boundaries.
+function MDEdit:wrapTableCell(text, base_style, maxw)
+    local rows = {}
+    local function new_row() return { segs = {}, w = 0, sb = 0, indent = 0 } end
+    local row = new_row()
+    local function finish_row()
+        rows[#rows+1] = row
+        row = new_row()
+    end
+    local function append(piece, style, hl)
+        if piece == "" then return end
+        local width = self:wordw(piece, style)
+        row.segs[#row.segs+1] = { text = piece, display = piece, style = style, hl = hl, w = width }
+        row.w = row.w + width
+    end
+    for _, span in ipairs(self:tableInlineSpans(text, base_style)) do
+        local raw, pos = span.display or span.text or "", 1
+        while pos <= #raw do
+            local unit = raw:match("^%s+", pos) or raw:match("^%S+", pos) or raw:sub(pos)
+            local width = self:wordw(unit, span.style)
+            if not unit:match("^%s") and #row.segs > 0 and row.w + width > maxw then finish_row() end
+            if not unit:match("^%s") and width > maxw then
+                local rest = unit
+                while rest ~= "" do
+                    local i, piece = 0, ""
+                    while true do
+                        local nxt = utf8_right(rest, i)
+                        if nxt == i then break end
+                        local candidate = rest:sub(1, nxt)
+                        if self:wordw(candidate, span.style) <= maxw then piece, i = candidate, nxt else break end
+                    end
+                    if piece == "" then piece = rest:sub(1, math.max(1, utf8_right(rest, 0))) end
+                    append(piece, span.style, span.hl)
+                    rest = rest:sub(#piece + 1)
+                    if rest ~= "" then finish_row() end
+                end
+            else
+                append(unit, span.style, span.hl)
+            end
+            pos = pos + #unit
+        end
+    end
+    if #row.segs > 0 or #rows == 0 then rows[#rows+1] = row end
+    return rows
 end
 function MDEdit:layoutTable(tbl, availw)
     local pad_x = math.floor(MDEDIT_TABLE_PAD_X * self.scale)
@@ -1125,7 +2423,7 @@ function MDEdit:layoutTable(tbl, availw)
             -- Reserve padding + the cell's 1px left/right borders (the same 2px the
             -- wrap width subtracts below) + a little rounding slack, so a column
             -- sized to its own text never wraps that text mid-word.
-            nat[c] = math.max(nat[c], self:wordw(cell and cell.text or "", style) + pad_x2 + 4)
+            nat[c] = math.max(nat[c], self:tableInlineWidth(cell and cell.text or "", style) + pad_x2 + 4)
         end
     end
     local natsum = 0
@@ -1162,16 +2460,17 @@ function MDEdit:layoutTable(tbl, availw)
     local entries = {}
     for ri, tr in ipairs(tbl.rows) do
         local style = tr.header and "bold" or "normal"
-        local lineh = self:texth(style)
-        local wrapped, maxlines = {}, 1
+        local wrapped, content_h = {}, 0
         for c = 1, tbl.ncols do
             local cell = tr.cells[c]
             local inner = math.max(1, widths[c] - pad_x2 - 2)
-            local wl = self:wrapCellText(cell and cell.text or "", style, inner)
+            local wl = self:wrapTableCell(cell and cell.text or "", style, inner)
             wrapped[c] = wl
-            if #wl > maxlines then maxlines = #wl end
+            local cell_h = 0
+            for _, line in ipairs(wl) do cell_h = cell_h + self:rowTextHeight(line) end
+            content_h = math.max(content_h, cell_h)
         end
-        local rowh = math.max(24, maxlines * lineh + 2 * pad_y + 2)
+        local rowh = math.max(24, content_h + 2 * pad_y + 2)
         entries[#entries+1] = {
             kind = "table_row",
             line = tr.line,
@@ -1184,12 +2483,11 @@ function MDEdit:layoutTable(tbl, availw)
             col_widths = widths,
             aligns = tbl.aligns,
             wrapped = wrapped,
-            lineh = lineh,
         }
     end
     return entries
 end
-function MDEdit:tableCell(lines, colw, rowh, style, align)
+function MDEdit:tableCell(lines, colw, rowh, align)
     local pad_x = math.floor(MDEDIT_TABLE_PAD_X * self.scale)
     local border = 1
     -- FrameContainer:getSize() ignores its own `width`/`height` and measures its
@@ -1199,26 +2497,46 @@ function MDEdit:tableCell(lines, colw, rowh, style, align)
     -- is exactly colw x rowh and the columns line up across rows.
     local inner_w = math.max(1, colw - 2 * border)
     local inner_h = math.max(1, rowh - 2 * border)
-    local face = md_face(style, self.scale)
     local vg = VerticalGroup:new{ align = "left" }
-    for _, ln in ipairs(lines or { "" }) do
-        local tw = self:textw(ln, face)
+    for _, line in ipairs(lines or {}) do
+        local lineh = self:rowTextHeight(line)
+        local tw = line.w or 0
         local left = pad_x
         if align == "right" then left = math.max(pad_x, inner_w - pad_x - tw)
         elseif align == "center" then left = math.max(pad_x, math.floor((inner_w - tw) / 2)) end
+        local layers = { dimen = Geom:new{ w = math.max(1, tw), h = lineh } }
+        local hx, hstart = 0, nil
+        local function flush_highlight(xend)
+            if hstart and xend > hstart then
+                layers[#layers+1] = HorizontalGroup:new{ align = "top",
+                    HorizontalSpan:new{ width = hstart },
+                    LineWidget:new{ background = MDEDIT_HIGHLIGHT_GRAY,
+                        dimen = Geom:new{ w = math.max(2, xend - hstart), h = lineh } },
+                }
+            end
+            hstart = nil
+        end
+        for _, seg in ipairs(line.segs or {}) do
+            if seg.hl then
+                if (seg.w or 0) > 0 and not hstart then hstart = hx end
+            else
+                flush_highlight(hx)
+            end
+            hx = hx + (seg.w or 0)
+        end
+        flush_highlight(hx)
+        layers[#layers+1] = self:renderRow(line)
         vg[#vg+1] = HorizontalGroup:new{
-            HorizontalSpan:new{ width = left },
-            TextWidget:new{ text = ln, face = face, fgcolor = Blitbuffer.COLOR_BLACK },
+            HorizontalSpan:new{ width = left }, OverlapGroup:new(layers),
         }
     end
     return FrameContainer:new{ bordersize = border, padding = 0, margin = 0,
         LeftContainer:new{ dimen = Geom:new{ w = inner_w, h = inner_h }, vg } }
 end
 function MDEdit:renderTableRow(vr)
-    local style = vr.header and "bold" or "normal"
     local hg = HorizontalGroup:new{ align = "top" }
     for c = 1, #vr.col_widths do
-        hg[#hg+1] = self:tableCell(vr.wrapped and vr.wrapped[c], vr.col_widths[c], vr.h, style, vr.aligns[c])
+        hg[#hg+1] = self:tableCell(vr.wrapped and vr.wrapped[c], vr.col_widths[c], vr.h, vr.aligns[c])
     end
     return hg
 end
@@ -1288,13 +2606,27 @@ function MDEdit:replaceTableCell(hit, value)
 end
 function MDEdit:openTableCellEditor(hit)
     if not hit or not hit.cell then return false end
+    self:flushTypeBuffer()
     if self._page_pending then UIManager:unschedule(self._page_pending); self._page_pending = nil end
     self._rtap = nil
+    -- The editor's own non-modal keyboard targets MDEdit directly. Leaving it on
+    -- the stack under an InputDialog makes its keys continue editing the document,
+    -- even though the table-cell field is visibly on top.
+    if self.keyboard then self:hideKeyboard() end
     local dlg
+    local restored = false
+    local function restore_editor_focus()
+        if restored then return false end
+        restored = true
+        self._table_cell_dialog = nil
+        self.is_always_active = true
+        return true
+    end
     -- The dialog and its on-screen keyboard cover a large slice of the screen;
     -- closing them only repaints that dialog region, leaving the editor beneath
     -- half-blank. Force a full editor repaint on either exit.
     local function dismiss(layout_dirty)
+        restore_editor_focus()
         UIManager:close(dlg)
         self:refresh{ layout_dirty = layout_dirty and true or false, full = true }
     end
@@ -1313,6 +2645,18 @@ function MDEdit:openTableCellEditor(hit)
             end },
         }},
     }
+    -- MDEdit is normally always active so external keyboards work reliably. A
+    -- modal input field is the exception: suspend the document's key handler so
+    -- physical keystrokes are delivered exclusively to InputDialog.
+    self._table_cell_dialog = dlg
+    self.is_always_active = false
+    local editor, original_close = self, dlg.onCloseWidget
+    function dlg:onCloseWidget()
+        if original_close then original_close(self) end
+        if restore_editor_focus() and editor._caret_blinking then
+            editor:refresh{ layout_dirty = false, full = true }
+        end
+    end
     UIManager:show(dlg)
     dlg:onShowKeyboard()
     return true
@@ -1418,10 +2762,63 @@ function MDEdit:visualRows(text_w)
     if self._vrows and self._vrows_w == text_w and not self._vrows_dirty then
         return self._vrows
     end
+    if self._vrows then
+        local seen = {}
+        for _, vr in ipairs(self._vrows) do
+            local row = vr.row
+            if row and row._rendered and not seen[row] then row._rendered:free(); row._rendered = nil; seen[row] = true end
+        end
+    end
     self._vrows = self:computeVisualRows(text_w)
     self._vrows_w = text_w
     self._vrows_dirty = false
+    self:reindexVisualRows()
     return self._vrows
+end
+function MDEdit:reindexVisualRows()
+    local ranges = {}
+    for vi, vr in ipairs(self._vrows or {}) do
+        if vr.kind == "row" and vr.line then
+            local r = ranges[vr.line]
+            if not r then ranges[vr.line] = { first = vi, last = vi }
+            else r.last = vi end
+        end
+    end
+    self._vrow_line_ranges = ranges
+end
+-- Fast path for ordinary single-line typing/backspace. It deliberately bails
+-- out around tables and structural changes, where a full layout is safer.
+function MDEdit:updateVisualLine(line)
+    local vrows, text_w = self._vrows, self._vrows_w
+    if not vrows or text_w ~= self:textWidth() or self._vrows_dirty then return false end
+    local text = self.lines[line] or ""
+    if text:find("|", 1, true) or ((self.lines[line - 1] or ""):find("|", 1, true))
+        or ((self.lines[line + 1] or ""):find("|", 1, true)) then return false end
+    local range = self._vrow_line_ranges and self._vrow_line_ranges[line]
+    if not range then return false end
+    for vi = range.first, range.last do
+        if vrows[vi].kind ~= "row" then return false end
+    end
+    local toks = md_tokenize(text)[1]
+    local replacement = {}
+    for ri, row in ipairs(self:layoutLine(toks, text_w)) do
+        replacement[#replacement+1] = { kind = "row", line = line, row = row, block = toks.block, ri = ri }
+    end
+    -- Release native glyph buffers for only the superseded rows. These rows are
+    -- not stored in the content-keyed wrap cache on this incremental path.
+    for vi = range.first, range.last do
+        local row = vrows[vi].row
+        if row and row._rendered then row._rendered:free(); row._rendered = nil end
+    end
+    local remove = range.last - range.first + 1
+    for _ = 1, remove do table.remove(vrows, range.first) end
+    for i = #replacement, 1, -1 do table.insert(vrows, range.first, replacement[i]) end
+    self:reindexVisualRows()
+    self._incremental_vrow_edits = (self._incremental_vrow_edits or 0) + 1
+    -- Periodically rebuild the content-keyed cache, which bounds memory from
+    -- unique words typed over a long session without taxing each keystroke.
+    if self._incremental_vrow_edits >= 32 then self._vrows_dirty = true; self._incremental_vrow_edits = 0 end
+    return true
 end
 -- Locate the caret within the cached rows. Cheap: only scans row metadata and
 -- measures within the single logical line that holds the cursor.
@@ -1478,7 +2875,16 @@ function MDEdit:rebuild()
     end
     local editor_top = MDEDIT_PAD + MDEDIT_TOPBAR_H + MDEDIT_TOPBAR_GAP
     local progress_area = MDEDIT_PROGRESS_GAP + MDEDIT_PROGRESS_H
-    local budget = self.fh - editor_top - MDEDIT_PAD - kbd_h - progress_area
+    -- The repaint area always runs from the top down to the keyboard's top edge
+    -- (or the whole screen when no keyboard is up). Text, though, stops short of
+    -- that: with the keyboard up the progress bar and the frame's bottom padding
+    -- are hidden behind it and aren't needed, so text may run down to just above
+    -- the keyboard (leaving only MDEDIT_KBD_TEXT_GAP); otherwise it leaves room for
+    -- the pinned progress bar and the bottom padding.
+    local refresh_bottom = self.fh - kbd_h
+    local body_bottom = self.keyboard and (refresh_bottom - MDEDIT_KBD_TEXT_GAP)
+        or (self.fh - MDEDIT_PAD - progress_area)
+    local budget = body_bottom - editor_top
     self.visible_budget = budget
     local body = VerticalGroup:new{ align = "left" }
     local visual_rows = self:visualRows(text_w)
@@ -1533,7 +2939,29 @@ function MDEdit:rebuild()
             if used + rowh > budget then break end
             local slo, shi = self:lineSel(i)
             local args = { dimen = Geom:new{ w = text_w, h = rowh } }
-            if slo and not self.reader_mode then          -- selection highlight, drawn behind the text
+            -- Persistent ==highlight== fill, drawn behind the text in every mode.
+            -- Contiguous highlight segments are merged into one bar so word gaps
+            -- don't leave hairline seams. (Selection, added next, paints on top.)
+            local hx, hstart = row.indent or 0, nil
+            local function flush_hl(xend)
+                if hstart and xend > hstart then
+                    args[#args+1] = HorizontalGroup:new{ align = "top", HorizontalSpan:new{ width = hstart },
+                        LineWidget:new{ background = MDEDIT_HIGHLIGHT_GRAY, dimen = Geom:new{ w = math.max(2, xend - hstart), h = rowh } } }
+                end
+                hstart = nil
+            end
+            for _, seg in ipairs(row.segs) do
+                if seg.hl then
+                    -- Keep the run open across hidden zero-width inner markers (the
+                    -- **/`/* of nested styles) so the fill is one continuous bar.
+                    if (seg.w or 0) > 0 and not hstart then hstart = hx end
+                else
+                    flush_hl(hx)
+                end
+                hx = hx + (seg.w or 0)
+            end
+            flush_hl(hx)
+            if slo then                                   -- selection highlight, drawn behind the text
                 local rb = row.sb
                 for _, sg in ipairs(row.segs) do rb = rb + #sg.text end
                 local a, b = math.max(slo, row.sb), math.min(shi, rb)
@@ -1568,24 +2996,29 @@ function MDEdit:rebuild()
     vg[#vg+1] = body
     self.editor_refresh_region = Geom:new{
         x = 0, y = 0, w = self.fw,
-        h = math.max(1, editor_top + budget + progress_area + MDEDIT_PAD),
+        h = math.max(1, refresh_bottom),
     }
     -- Same as editor_refresh_region but starting below the top bar. The toolbar/
     -- title never change while scrolling, selecting, or reflowing text, so those
     -- repaints should leave it untouched (no e-ink flash of a stable strip).
     self.editor_body_region = Geom:new{
         x = 0, y = editor_top, w = self.fw,
-        h = math.max(1, budget + progress_area + MDEDIT_PAD),
+        h = math.max(1, refresh_bottom - editor_top),
     }
     -- The progress bar is pinned to the very bottom of the screen (below the text
     -- frame's padding) so it holds a fixed position regardless of how much text is
-    -- on screen, and never crowds the last line.
-    self[1] = OverlapGroup:new{
+    -- on screen, and never crowds the last line. It's dropped entirely while the
+    -- keyboard is up -- it would only sit hidden behind the keys, and skipping it
+    -- frees that strip for text.
+    local layers = OverlapGroup:new{
         dimen = Geom:new{ x = 0, y = 0, w = self.fw, h = self.fh },
         FrameContainer:new{ background = Blitbuffer.COLOR_WHITE, bordersize = 0, padding = MDEDIT_PAD,
             width = self.fw, height = self.fh, vg },
-        BottomContainer:new{ dimen = Geom:new{ w = self.fw, h = self.fh - 5 }, self:progressBar(cw) },
     }
+    if not self.keyboard then
+        layers[#layers+1] = BottomContainer:new{ dimen = Geom:new{ w = self.fw, h = self.fh - 5 }, self:progressBar(cw) }
+    end
+    self[1] = layers
 end
 -- Bounding bands (full width) of logical-line rows, for narrow e-ink refreshes
 -- while typing.
@@ -1600,56 +3033,138 @@ function MDEdit:lineBand(row)
     if not y0 then return nil end
     return Geom:new{ x = 0, y = math.max(0, y0 - 2), w = self.fw, h = (y1 - y0) + 4 }
 end
-function MDEdit:lineTailBand(row, col)
+-- Band (full width) from the cursor's own visual row down through the rest of the
+-- current logical line. A same-line edit changes the cursor's row AND can rewrap
+-- the rows after it within the line (a word crossing the wrap boundary), but never
+-- the rows above the cursor -- so this is the tightest region that stays correct.
+-- (When the line's height changes, content below shifts too; that's the reflow
+-- path, which repaints from here down to the bottom.)
+function MDEdit:cursorRowBand()
     local y0, y1
     for _, rm in ipairs(self.row_map or {}) do
-        if rm.line == row then
-            local include = true
-            if rm.row then
-                local rb = rm.row.sb or 0
-                for _, sg in ipairs(rm.row.segs or {}) do rb = rb + #(sg.text or "") end
-                include = col == nil or col <= rb
-            end
-            if include then
-                y0 = math.min(y0 or rm.y0, rm.y0)
-                y1 = math.max(y1 or rm.y1, rm.y1)
+        if rm.line == self.crow and rm.row then
+            local sb = rm.row.sb or 0
+            local rb = sb
+            for _, sg in ipairs(rm.row.segs or {}) do rb = rb + #(sg.text or "") end
+            if not y0 then
+                if self.ccol >= sb and self.ccol <= rb then y0, y1 = rm.y0, rm.y1 end
+            else
+                y1 = math.max(y1, rm.y1)   -- extend through later rows of the same line
             end
         end
     end
-    if not y0 then return self:lineBand(row) end
+    if not y0 then return self:lineBand(self.crow) end   -- fallback: whole line
     return Geom:new{ x = 0, y = math.max(0, y0 - 2), w = self.fw, h = (y1 - y0) + 4 }
 end
-function MDEdit:lineTailRegions(row_map, row, col)
-    local regions, first = {}, true
-    for _, rm in ipairs(row_map or {}) do
-        if rm.line == row and rm.row then
-            local rb = rm.row.sb or 0
-            for _, sg in ipairs(rm.row.segs or {}) do rb = rb + #(sg.text or "") end
-            if col == nil or col <= rb then
-                local x = 0
-                if first then
-                    x = math.max(0, MDEDIT_PAD + self:rowXAt(rm.row, math.max(col or 0, rm.row.sb or 0)) - 2)
-                    first = false
-                end
-                -- Repaint the whole tail out to the screen edge. Capping this to the
-                -- text width left stale glyphs while typing (partial e-ink updates
-                -- didn't clear the old pixels), which read as garbled text.
-                regions[#regions+1] = Geom:new{
-                    x = x,
-                    y = math.max(0, rm.y0 - 2),
-                    w = math.max(1, self.fw - x),
-                    h = (rm.y1 - rm.y0) + 4,
-                }
+-- Stable description of the pixels produced by one wrapped text row. Comparing
+-- these before and after a local edit lets us skip wrapped rows whose contents did
+-- not actually move. Geometry is compared separately when building the region.
+function MDEdit:rowPaintKey(rm)
+    if not (rm and rm.row) then return nil end
+    local row = rm.row
+    local parts = {
+        tostring(row.indent or 0), tostring(row.w or 0),
+    }
+    for _, seg in ipairs(row.segs or {}) do
+        local visible = seg.display == nil and (seg.text or "") or seg.display
+        parts[#parts+1] = table.concat({
+            visible, seg.style or "", seg.hl and "1" or "0", tostring(seg.w or 0),
+        }, "\2")
+    end
+    return table.concat(parts, "\3")
+end
+-- Rendered prefix before an absolute source column. This catches Markdown edits
+-- that restyle text to the left of the insertion point (for example completing a
+-- closing ** marker), where starting the refresh at the caret would be incorrect.
+function MDEdit:rowPrefixPaintKey(row, col)
+    local parts, byte = { tostring(row.indent or 0) }, row.sb or 0
+    for _, seg in ipairs(row.segs or {}) do
+        local raw = seg.text or ""
+        local take = math.max(0, math.min(#raw, (col or byte) - byte))
+        if take > 0 then
+            local visible
+            -- layoutLine stores ordinary text with display == raw. Treat that as
+            -- directly sliceable text; only genuinely synthetic/hidden display
+            -- values (bullets, task boxes, Markdown markers) need all-or-nothing
+            -- handling. Misclassifying display == raw made edits at a word end
+            -- look like the rendered prefix changed and widened the dirty row to
+            -- x = 0, flashing all text to the left of the cursor.
+            if seg.display == nil or seg.display == raw then
+                visible = raw:sub(1, take)
+            elseif take >= #raw then
+                visible = seg.display
+            else
+                visible = "" -- hidden/synthetic markers have no useful partial glyph prefix
             end
+            parts[#parts+1] = table.concat({
+                visible, seg.style or "", seg.hl and "1" or "0",
+            }, "\2")
+        end
+        byte = byte + #raw
+        if byte >= (col or byte) then break end
+    end
+    return table.concat(parts, "\3")
+end
+-- X position of the UTF-8 character immediately before an absolute source
+-- column within this visual row. Starting precise refreshes here protects the
+-- preceding glyph's edge/kerning pixels from being left white by e-ink updates.
+function MDEdit:previousGlyphX(row, col)
+    local raw = {}
+    for _, seg in ipairs(row.segs or {}) do raw[#raw+1] = seg.text or "" end
+    raw = table.concat(raw)
+    local local_col = math.max(0, math.min(#raw, (col or row.sb or 0) - (row.sb or 0)))
+    local prev_col = utf8_left(raw, local_col)
+    return self:rowXAt(row, (row.sb or 0) + prev_col)
+end
+-- Regions changed by an insertion/deletion within one logical line. The first
+-- affected row starts at the earlier old/new edit position; later rows are only
+-- included when wrapping actually changed their rendered pixels. Extending each
+-- changed tail to the right edge is deliberate: narrower e-ink updates left stale
+-- glyph fragments, but there is no reason to repaint unchanged rows below it.
+function MDEdit:changedLineRegions(prev_row_map, row_map, row, prev_col, col)
+    local old, new = {}, {}
+    for _, rm in ipairs(prev_row_map or {}) do
+        if rm.line == row and rm.row then old[#old+1] = rm end
+    end
+    for _, rm in ipairs(row_map or {}) do
+        if rm.line == row and rm.row then new[#new+1] = rm end
+    end
+    if #old == 0 or #old ~= #new then return nil end
+
+    local regions = {}
+    for i = 1, #old do
+        local before, after = old[i], new[i]
+        if self:rowPaintKey(before) ~= self:rowPaintKey(after)
+            or before.y0 ~= after.y0 or before.y1 ~= after.y1 then
+            local x = 0
+            local old_sb = before.row.sb or 0
+            local new_sb = after.row.sb or 0
+            local old_rb, new_rb = old_sb, new_sb
+            for _, seg in ipairs(before.row.segs or {}) do old_rb = old_rb + #(seg.text or "") end
+            for _, seg in ipairs(after.row.segs or {}) do new_rb = new_rb + #(seg.text or "") end
+            local old_here = prev_col and prev_col >= old_sb and prev_col <= old_rb
+            local new_here = col and col >= new_sb and col <= new_rb
+            if old_here or new_here then
+                local change_col = math.min(prev_col or col or 0, col or prev_col or 0)
+                local prefix_changed = self:rowPrefixPaintKey(before.row, change_col)
+                    ~= self:rowPrefixPaintKey(after.row, change_col)
+                if not prefix_changed then
+                    local old_x = change_col >= old_sb and change_col <= old_rb
+                        and self:previousGlyphX(before.row, change_col) or nil
+                    local new_x = change_col >= new_sb and change_col <= new_rb
+                        and self:previousGlyphX(after.row, change_col) or nil
+                    local edit_x = old_x and new_x and math.min(old_x, new_x) or old_x or new_x or 0
+                    x = math.max(0, MDEDIT_PAD + edit_x - 2)
+                end
+            end
+            local y0 = math.max(0, math.min(before.y0, after.y0) - 2)
+            local y1 = math.max(before.y1, after.y1) + 2
+            regions[#regions+1] = Geom:new{
+                x = x, y = y0, w = math.max(1, self.fw - x), h = math.max(1, y1 - y0),
+            }
         end
     end
-    return #regions > 0 and regions or nil
-end
-function MDEdit:addRegions(dst, src)
-    if not src then return dst end
-    dst = dst or {}
-    for _, region in ipairs(src) do dst[#dst+1] = region end
-    return dst
+    return regions
 end
 -- The slice from the top of a logical line down to the bottom of the editor.
 -- After a reflow (wrap/newline/join) or a line-height change, only this line and
@@ -1660,6 +3175,25 @@ function MDEdit:regionFromLineToBottom(row)
     if not band then return nil end
     local bottom = self.editor_refresh_region.y + self.editor_refresh_region.h
     return Geom:new{ x = 0, y = band.y, w = self.fw, h = math.max(1, bottom - band.y) }
+end
+-- Like regionFromLineToBottom but starting at the cursor's own visual row rather
+-- than the top of its (possibly tall, wrapped) paragraph. A same-line reflow -- a
+-- word wrapping within the paragraph -- only shifts content from the cursor down,
+-- so the rows above the cursor must not be blanked/repainted.
+function MDEdit:regionFromCursorRowToBottom()
+    local y0
+    for _, rm in ipairs(self.row_map or {}) do
+        if rm.line == self.crow and rm.row then
+            local sb = rm.row.sb or 0
+            local rb = sb
+            for _, sg in ipairs(rm.row.segs or {}) do rb = rb + #(sg.text or "") end
+            if self.ccol >= sb and self.ccol <= rb then y0 = rm.y0; break end
+        end
+    end
+    if not y0 then return nil end
+    local top = math.max(0, y0 - 2)
+    local bottom = self.editor_refresh_region.y + self.editor_refresh_region.h
+    return Geom:new{ x = 0, y = top, w = self.fw, h = math.max(1, bottom - top) }
 end
 function MDEdit:unionRegion(a, b)
     if not a then return b end
@@ -1673,6 +3207,39 @@ end
 function MDEdit:selectionIsMultiline()
     local lr, _, hr = self:selRange()
     return lr ~= nil and hr ~= nil and lr ~= hr
+end
+function MDEdit:caretRowTop(caret, row_map)
+    if not caret then return nil end
+    local cy = caret.y + math.floor(caret.h / 2)
+    for _, rm in ipairs(row_map or {}) do
+        if rm.row and cy >= rm.y0 and cy <= rm.y1 then return rm.y0 end
+    end
+    return nil
+end
+function MDEdit:regionFromCaretTransitionToBottom(prev_caret, prev_row_map)
+    local old_top = self:caretRowTop(prev_caret, prev_row_map)
+    local new_top = self:caretRowTop(self.caret_region, self.row_map)
+    local top = old_top and new_top and math.min(old_top, new_top) or old_top or new_top
+    if not top then return nil end
+    top = math.max(0, top - 2)
+    local bottom = self.editor_refresh_region.y + self.editor_refresh_region.h
+    return Geom:new{ x = 0, y = top, w = self.fw, h = math.max(1, bottom - top) }
+end
+-- Full-width band spanning every *visible* row of logical lines [from,to]. Lets a
+-- highlight add/remove repaint just the edited line(s) instead of the whole screen.
+-- Returns nil if none of those lines are currently on screen.
+function MDEdit:linesRegion(from, to)
+    if not from or not to then return nil end
+    if from > to then from, to = to, from end
+    local y0, y1
+    for _, rm in ipairs(self.row_map or {}) do
+        if rm.line >= from and rm.line <= to then
+            y0 = y0 and math.min(y0, rm.y0) or rm.y0
+            y1 = y1 and math.max(y1, rm.y1) or rm.y1
+        end
+    end
+    if not y0 then return nil end
+    return Geom:new{ x = 0, y = y0, w = self.fw, h = math.max(1, y1 - y0) }
 end
 function MDEdit:refresh(opts)
     opts = opts or {}
@@ -1704,14 +3271,28 @@ function MDEdit:refresh(opts)
     -- With the on-screen keyboard visible, keep refreshing the whole editor band;
     -- partial editor redraws above a live keyboard leave mixed e-ink regions.
     local reflow = prev_count and self.visual_count ~= prev_count
-    if opts.full then
+    if opts.lines then
+        -- Caller knows exactly which logical lines changed (e.g. a highlight edit):
+        -- repaint only those, never the whole screen.
+        region = self:linesRegion(opts.lines[1], opts.lines[2]) or self.editor_body_region
+    elseif opts.full then
         region = self.editor_refresh_region
     elseif selection_dirty or vtop_changed then
         region = self.editor_body_region
     elseif reflow or line_geometry_changed then
         if self.keyboard then
             region = self.editor_refresh_region
+        elseif prev_crow == self.crow then
+            -- Reflow within the same paragraph (a word wrapped): only content from
+            -- the earlier of the old/new cursor rows down moved. Including the old
+            -- row clears text that moved onto the new row without repainting above it.
+            region = self:regionFromCaretTransitionToBottom(prev_caret, prev_row_map)
+                or self:regionFromCursorRowToBottom()
+                or self:regionFromLineToBottom(self.crow)
+                or self.editor_refresh_region
         else
+            -- Line split/join: the edit spans two logical lines; repaint from the
+            -- higher of the two down.
             region = self:regionFromLineToBottom(math.min(prev_crow or self.crow, self.crow))
                 or self.editor_refresh_region
         end
@@ -1725,21 +3306,27 @@ function MDEdit:refresh(opts)
             elseif prev_crow and prev_crow ~= self.crow then
                 band = self:unionRegion(self:lineBand(prev_crow), band)
             end
-        elseif opts.precise_edit then
-            regions = self:addRegions(regions, self:lineTailRegions(prev_row_map, prev_crow, prev_ccol))
-            regions = self:addRegions(regions, self:lineTailRegions(self.row_map, self.crow, self.ccol))
+        elseif opts.precise_edit and prev_crow == self.crow then
+            -- Ordinary typing/backspace: compare the old and new wrapped rows and
+            -- invalidate only rows whose pixels changed. In the common case this
+            -- is one tail on one row, even near the bottom of the screen.
+            regions = self:changedLineRegions(prev_row_map, self.row_map,
+                self.crow, prev_ccol, self.ccol)
             if regions then
+                -- A zero-width Markdown marker can change the source without
+                -- changing row pixels; in that case only the caret moved.
+                if #regions == 0 then
+                    if prev_caret then regions[#regions+1] = prev_caret end
+                    if self.caret_region then regions[#regions+1] = self.caret_region end
+                end
                 band = nil
             else
-                band = self:lineTailBand(self.crow, self.ccol)
+                band = self:cursorRowBand()
             end
         else
-            band = self:lineTailBand(self.crow, self.ccol)
-            if prev_crow and prev_crow ~= self.crow then
-                band = self:unionRegion(self:lineTailBand(prev_crow, prev_ccol), band)
-            elseif prev_ccol and prev_ccol ~= self.ccol then
-                band = self:unionRegion(self:lineTailBand(self.crow, prev_ccol), band)
-            end
+            -- Broader same-line edits may alter styling without going through the
+            -- precise path, so conservatively refresh from the cursor row onward.
+            band = self:cursorRowBand()
         end
         if band then region = band end
     end
@@ -1764,6 +3351,25 @@ function MDEdit:refreshScroll()
     self:rebuild()
     UIManager:setDirty(self, "ui", self.editor_body_region)
 end
+function MDEdit:checkRemoteInbox()
+    if not self.remote then return end
+    local revision = tonumber(read_file(self.remote.revision_path) or "")
+    if not revision or revision <= (self.remote_revision or 0) then return end
+    -- Preserve local Kindle changes until the worker has handed them off.
+    if self._dirty or lfs.attributes(self.remote.outbox_path, "mode") then return end
+    local text = read_file(self.remote.inbox_path)
+    if text == nil then return end
+    self.remote_revision = revision
+    if text == self:currentText() then return end
+    write_file(self.path, text)
+    self.lines = split_text_lines(text)
+    self.crow = math.max(1, math.min(self.crow or 1, #self.lines))
+    self.ccol = math.max(0, math.min(self.ccol or 0, #(self.lines[self.crow] or "")))
+    self.sel, self._desired_x, self._burst = nil, nil, nil
+    self._undo, self._redo = {}, {}
+    self._file_text, self._file_signature = text, file_signature(self.path)
+    self:refresh{ layout_dirty = true, full = true }
+end
 function MDEdit:scheduleAutosave()
     self._dirty = true
     if self._autosave_paused_for_external then return end
@@ -1777,11 +3383,13 @@ function MDEdit:scheduleAutosave()
     UIManager:scheduleIn(MDEDIT_AUTOSAVE_DELAY, fn)
 end
 function MDEdit:flushAutosave()
+    self:flushTypeBuffer()
     if self._autosave_pending then UIManager:unschedule(self._autosave_pending); self._autosave_pending = nil end
     if self._autosave_paused_for_external then return end
     if self._dirty then self:save() end
 end
 function MDEdit:currentText()
+    self:flushTypeBuffer()
     return table.concat(self.lines, "\n")
 end
 function MDEdit:reloadFromDisk(text, sig)
@@ -1847,6 +3455,7 @@ function MDEdit:scheduleFilePoll()
         if self._file_poll_pending == fn then self._file_poll_pending = nil end
         if self._closing then return end
         self:checkExternalFile()
+        self:checkRemoteInbox()
         self:scheduleFilePoll()
     end
     self._file_poll_pending = fn
@@ -1859,15 +3468,36 @@ function MDEdit:snapshot()
     if #self._undo > 80 then table.remove(self._undo, 1) end
     self._redo = {}
 end
+function MDEdit:snapshotLine()
+    self:scheduleAutosave()
+    self._undo = self._undo or {}
+    self._undo[#self._undo+1] = {
+        kind = "line", line = self.crow, text = self.lines[self.crow] or "",
+        crow = self.crow, ccol = self.ccol,
+    }
+    if #self._undo > 80 then table.remove(self._undo, 1) end
+    self._redo = {}
+end
 function MDEdit:edit(tag)             -- snapshot once per edit "burst" (typing vs deleting)
-    if self._burst ~= tag then self:snapshot() end
+    if self._burst ~= tag then
+        -- The sustained typing/backspace path changes one logical line. Keeping
+        -- just that line avoids copying every line of a large note for undo.
+        if tag == "type" or (tag == "del" and self.ccol > 0) then self:snapshotLine() else self:snapshot() end
+    else self:scheduleAutosave() end
     self._burst = tag
 end
 function MDEdit:_restore(stack, other)
     if not (stack and #stack > 0) then return end
-    other[#other+1] = { lines = copy_arr(self.lines), crow = self.crow, ccol = self.ccol }
     local s = table.remove(stack)
-    self.lines, self.crow, self.ccol, self._burst = s.lines, s.crow, s.ccol, nil
+    if s.kind == "line" then
+        other[#other+1] = { kind = "line", line = s.line, text = self.lines[s.line] or "", crow = self.crow, ccol = self.ccol }
+        self.lines[s.line] = s.text
+        self.crow, self.ccol = s.crow, s.ccol
+    else
+        other[#other+1] = { lines = copy_arr(self.lines), crow = self.crow, ccol = self.ccol }
+        self.lines, self.crow, self.ccol = s.lines, s.crow, s.ccol
+    end
+    self._burst = nil
     self._desired_x = nil
     self:scheduleAutosave()
     self:refresh()
@@ -1967,6 +3597,7 @@ function MDEdit:rowXAt(row, p)        -- x of absolute byte col p within a visua
     return x
 end
 function MDEdit:arrow(drow, dcol, m)  -- arrow key with optional Shift (select) / Alt-or-Command (word)
+    self:flushTypeBuffer()
     local selecting = keymod(m, "Shift")
     if selecting then if not self.sel then self.sel = { row = self.crow, col = self.ccol } end
     else self.sel = nil end
@@ -1974,23 +3605,65 @@ function MDEdit:arrow(drow, dcol, m)  -- arrow key with optional Shift (select) 
     else self:moveCursor(drow, dcol, { selection = selecting }) end
 end
 local md_split_line_prefix
-function MDEdit:addChars(s)
-    if s == "\n" then return self:newline() end
+function MDEdit:insertTypedText(s)
+    if not s or s == "" then return end
+    self:pauseCaretBlinkForInput()
     self._desired_x = nil
     local had_sel = self:hasSel()
     if had_sel then self:snapshot(); self._burst = nil; self:deleteSelection() else self:edit("type") end
-    local l = self.lines[self.crow]
-    if s == " " and self.ccol >= 1 and l:sub(self.ccol, self.ccol) == " "
-       and (self.ccol < 2 or l:sub(self.ccol-1, self.ccol-1) ~= " ") then  -- double space -> ". "
-        self.lines[self.crow] = l:sub(1, self.ccol-1) .. ". " .. l:sub(self.ccol+1)
-        self.ccol = self.ccol + 1
-        return self:refresh()
+    for i = 1, #s do
+        local ch = s:sub(i, i)
+        local l = self.lines[self.crow]
+        if ch == " " and self.ccol >= 1 and l:sub(self.ccol, self.ccol) == " "
+           and (self.ccol < 2 or l:sub(self.ccol-1, self.ccol-1) ~= " ") then
+            self.lines[self.crow] = l:sub(1, self.ccol-1) .. ". " .. l:sub(self.ccol+1)
+            self.ccol = self.ccol + 1
+        else
+            self.lines[self.crow] = l:sub(1, self.ccol) .. ch .. l:sub(self.ccol+1)
+            self.ccol = self.ccol + #ch
+        end
     end
-    self.lines[self.crow] = l:sub(1, self.ccol) .. s .. l:sub(self.ccol+1)
-    self.ccol = self.ccol + #s
-    self:refresh{ precise_edit = not had_sel }
+    self._last_type_flush_at = now_seconds()
+    local incremental = not had_sel and self:updateVisualLine(self.crow)
+    self:refresh{ layout_dirty = not incremental, precise_edit = not had_sel }
+end
+function MDEdit:flushTypeBuffer()
+    if self._type_flush_pending then
+        UIManager:unschedule(self._type_flush_pending)
+        self._type_flush_pending = nil
+    end
+    local s = self._type_buffer
+    self._type_buffer = nil
+    if s and s ~= "" then self:insertTypedText(s) end
+end
+function MDEdit:queueTypedChar(ch)
+    self:pauseCaretBlinkForInput()
+    self._type_buffer = (self._type_buffer or "") .. ch
+    -- Give the first key after an idle pause near-immediate feedback, then settle
+    -- into a slightly wider cadence that batches sustained typing efficiently.
+    -- The pending callback is never rescheduled by later keys, so fast input
+    -- cannot defer rendering indefinitely.
+    if self._type_flush_pending then return end
+    local now = now_seconds()
+    local first_in_burst = not self._last_type_flush_at
+        or now - self._last_type_flush_at >= MDEDIT_TYPE_BURST_IDLE
+    local delay = first_in_burst and MDEDIT_TYPE_FIRST_FLUSH_DELAY or MDEDIT_TYPE_FLUSH_DELAY
+    local fn
+    fn = function()
+        if self._type_flush_pending == fn then self._type_flush_pending = nil end
+        local s = self._type_buffer
+        self._type_buffer = nil
+        if s and s ~= "" then self:insertTypedText(s) end
+    end
+    self._type_flush_pending = fn
+    UIManager:scheduleIn(delay, fn)
+end
+function MDEdit:addChars(s)
+    if s == "\n" then return self:newline() end
+    self:insertTypedText(s)
 end
 function MDEdit:newline()
+    self:flushTypeBuffer()
     self:snapshot(); self._burst = nil
     self._desired_x = nil
     if self:hasSel() then self:deleteSelection() end
@@ -2028,7 +3701,8 @@ function MDEdit:delChar()
         local prev = utf8_left(l, self.ccol)          -- delete the whole UTF-8 char to the left
         self.lines[self.crow] = l:sub(1, prev) .. l:sub(self.ccol+1)
         self.ccol = prev
-        return self:refresh{ precise_edit = true }
+        local incremental = self:updateVisualLine(self.crow)
+        return self:refresh{ layout_dirty = not incremental, precise_edit = true }
     elseif self.crow > 1 then
         local prev = self.lines[self.crow-1]
         self.ccol = #prev
@@ -2211,6 +3885,7 @@ function MDEdit:isKeyboardHideGesture(ges)
     return near_kbd_top and downward
 end
 function MDEdit:save()
+    self:flushTypeBuffer()
     local text = self:currentText()
     local out = io.open(self.path, "w")
     if out then
@@ -2219,6 +3894,7 @@ function MDEdit:save()
         self._dirty = false
         self._file_text = text
         self._file_signature = file_signature(self.path)
+        if self.remote then write_file(self.remote.outbox_path, text) end
         self._external_change_prompted = nil
         self._autosave_paused_for_external = nil
         if self._autosave_pending then UIManager:unschedule(self._autosave_pending); self._autosave_pending = nil end
@@ -2249,7 +3925,30 @@ function MDEdit:onResume()
     self:checkExternalFile()
     self.caret_on = true
     self:refresh{ layout_dirty = false, full = true }
+    FL.scheduleWakeSync()
     schedule_wake_repaint()
+end
+function MDEdit:onSuspend()
+    FL.captureBeforeSuspend()
+end
+function MDEdit:schedulePhysicalKeyboardRepaint()
+    if self._physical_keyboard_repaint_pending then
+        UIManager:unschedule(self._physical_keyboard_repaint_pending)
+        self._physical_keyboard_repaint_pending = nil
+    end
+    local fn
+    fn = function()
+        if self._physical_keyboard_repaint_pending == fn then
+            self._physical_keyboard_repaint_pending = nil
+        end
+        if self._closing then return end
+        -- externalkeyboard shows a one-second modal notice, then broadcasts this
+        -- event halfway through its lifetime. Repaint after that notice is gone;
+        -- an arrow key in the meantime must not be the final, caret-only refresh.
+        self:refresh{ layout_dirty = false, full = true }
+    end
+    self._physical_keyboard_repaint_pending = fn
+    UIManager:scheduleIn(0.65, fn)
 end
 -- A Bluetooth/USB keyboard attaching or detaching repaints chrome (and can close
 -- the on-screen keyboard) outside our control, leaving the screen half-blank.
@@ -2266,9 +3965,11 @@ function MDEdit:onPhysicalKeyboardConnected()
     else
         self:refresh{ layout_dirty = false, full = true }
     end
+    self:schedulePhysicalKeyboardRepaint()
 end
 function MDEdit:onPhysicalKeyboardDisconnected()
     self:refresh{ layout_dirty = false, full = true }
+    self:schedulePhysicalKeyboardRepaint()
 end
 function MDEdit:saveAndClose()
     self:save()
@@ -2288,12 +3989,27 @@ function MDEdit:saveAndOpenMarkdown()
 end
 function MDEdit:onCloseWidget()
     self._closing = true
-    if active_mdedit == self then active_mdedit = nil end
+    -- Flush before signalling the worker. The old ordering removed the shadow
+    -- first, then autosave recreated it, leaving an orphaned remote session.
+    self:flushTypeBuffer()
     self:flushAutosave()
+    if self.remote then
+        write_file(self.remote.closing_path, "1")
+        os.remove(MINFOLIO_REMOTE_DIR .. "/remote-session.lua")
+    end
+    if active_mdedit == self then active_mdedit = nil end
     self._caret_blinking = false
+    if self._caret_blink_pending then
+        UIManager:unschedule(self._caret_blink_pending)
+        self._caret_blink_pending = nil
+    end
     if self._file_poll_pending then UIManager:unschedule(self._file_poll_pending); self._file_poll_pending = nil end
     if self._page_pending then UIManager:unschedule(self._page_pending); self._page_pending = nil end
     if self._pan_reset then UIManager:unschedule(self._pan_reset); self._pan_reset = nil end
+    if self._physical_keyboard_repaint_pending then
+        UIManager:unschedule(self._physical_keyboard_repaint_pending)
+        self._physical_keyboard_repaint_pending = nil
+    end
     if Device.input and self._old_disable_double_tap ~= nil then
         Device.input.disable_double_tap = self._old_disable_double_tap
     end
@@ -2319,6 +4035,7 @@ function MDEdit:onKeyPress(key)
     local lname = name:lower()
     local m = key_mods(key)
     if shortcut_mod(m) and #name == 1 then
+        self:flushTypeBuffer()
         if lname == "z" then if keymod(m, "Shift") then self:redo() else self:undo() end; return true
         elseif lname == "y" then self:redo(); return true
         elseif lname == "c" then self:copy(); return true
@@ -2327,34 +4044,36 @@ function MDEdit:onKeyPress(key)
         elseif lname == "a" then self:selectAll(); return true end
     end
     if name == "Backspace" or name == "BackSpace" or name == "Del" or name == "Delete" then
+        self:flushTypeBuffer()
         if word_key_mod(m) then self:delWord() else self:delChar() end
     elseif name == "Press" or name == "Return" or name == "Enter" or name == "KP_Enter" then self:newline()
-    elseif fn_key_mod(m) and up_key(name) then self.sel = nil; self:pageUp()
-    elseif fn_key_mod(m) and down_key(name) then self.sel = nil; self:pageDown()
+    elseif fn_key_mod(m) and up_key(name) then self:flushTypeBuffer(); self.sel = nil; self:pageUp()
+    elseif fn_key_mod(m) and down_key(name) then self:flushTypeBuffer(); self.sel = nil; self:pageDown()
     elseif left_key(name)  then self:arrow(0, -1, m)
     elseif right_key(name) then self:arrow(0, 1, m)
     elseif up_key(name)    then self:arrow(-1, 0, m)
     elseif down_key(name)  then self:arrow(1, 0, m)
-    elseif page_up_key(name) then self.sel = nil; self:pageUp()
-    elseif page_down_key(name) then self.sel = nil; self:pageDown()
-    elseif name == "Space" or name == "space" or name == " " then if keymod(m, "Alt") then self.sel = nil; self:wordRight() else self:addChars(" ") end
-    elseif name == "ISO_Left_Tab" or name == "BackTab" then self:indentLine(-1)
+    elseif page_up_key(name) then self:flushTypeBuffer(); self.sel = nil; self:pageUp()
+    elseif page_down_key(name) then self:flushTypeBuffer(); self.sel = nil; self:pageDown()
+    elseif name == "Space" or name == "space" or name == " " then if keymod(m, "Alt") then self:flushTypeBuffer(); self.sel = nil; self:wordRight() else self:queueTypedChar(" ") end
+    elseif name == "ISO_Left_Tab" or name == "BackTab" then self:flushTypeBuffer(); self:indentLine(-1)
     elseif name == "Tab" then
+        self:flushTypeBuffer()
         if keymod(m, "Shift") then self:indentLine(-1)
         else
             local _, kind, _, task = md_split_line_prefix(self.lines[self.crow])
             if kind or task then self:indentLine(1) else self:addChars("  ") end
         end
-    elseif name == "Home" then self:goToStartOfLine()
-    elseif name == "End" then self:goToEndOfLine()
-    elseif KEYPAD_CHAR[name] then self:addChars(KEYPAD_CHAR[name])
+    elseif name == "Home" then self:flushTypeBuffer(); self:goToStartOfLine()
+    elseif name == "End" then self:flushTypeBuffer(); self:goToEndOfLine()
+    elseif KEYPAD_CHAR[name] then self:queueTypedChar(KEYPAD_CHAR[name])
     elseif #name == 1 then
         if keymod(m, "Alt") then return true end
         local ch = lname
         if keymod(m, "Shift") then
             if SHIFT_SYM[ch] then ch = SHIFT_SYM[ch] elseif ch:match("%a") then ch = ch:upper() end
         end
-        self:addChars(ch)
+        self:queueTypedChar(ch)
     end
     return true
 end
@@ -2364,6 +4083,13 @@ function MDEdit:onHold()
     return true
 end
 function MDEdit:onSwipe(_, ges)
+    -- A fast finger-lift after a reader-mode select comes through as a swipe
+    -- rather than pan_release; commit the highlight here too so a quick drag works.
+    if self._pan_mode == "rselect" then
+        self._pan_mode = nil
+        self:commitHighlightFromSelection()
+        return true
+    end
     if self._pan_mode == "select" then self._pan_mode = nil; return true end
     if self:isKeyboardRevealGesture(ges) then
         if self._pan_reset then UIManager:unschedule(self._pan_reset); self._pan_reset = nil end
@@ -2522,6 +4248,12 @@ function MDEdit:insertTable()
     self.ccol = math.min(2, #(self.lines[self.crow] or ""))
     self:refresh()
 end
+function MDEdit:openMindmap()
+    self:save()
+    if self.keyboard then self:hideKeyboard() end
+    local map = MindmapView:new{ editor = self }
+    UIManager:show(map, "full")
+end
 function MDEdit:runTopAction(name)
     if name == "menu" then self:openControls()
     elseif name == "edit" then self:setReaderMode(false)
@@ -2533,6 +4265,7 @@ function MDEdit:runTopAction(name)
     elseif name == "list" then self:fmtList()
     elseif name == "ordered" then self:fmtOrdered()
     elseif name == "task" then self:fmtTask()
+    elseif name == "mindmap" then self:openMindmap()
     elseif name == "reader" then self:setReaderMode(true)
     elseif name == "table" then self:insertTable()
     elseif name == "smaller" then self:bumpScale(-0.1)
@@ -2556,6 +4289,7 @@ function MDEdit:openControls()
         keyboard_item = { text = "Show keyboard", callback = function() self:showKeyboard() end }
     end
     show_controls({
+        { text = "Mindmap mode", callback = function() self:openMindmap() end },
         { text = "Reader mode", callback = function() self:setReaderMode(true) end },
         keyboard_item,
         { text = "Heading", callback = function() self:fmtHeader() end },
@@ -2598,6 +4332,20 @@ function MDEdit:onTap(_, ges)
         return true
     end
     if self.reader_mode then
+        -- Tapping on an existing highlight removes it (checked before the edge
+        -- page-turn zones, so a highlight near a screen edge still deletes).
+        if p.y >= 95 then
+            local hrow, hcol = self:pointToCursor(p)
+            if self:highlightRangeAt(hrow, hcol) then
+                if self._page_pending then UIManager:unschedule(self._page_pending); self._page_pending = nil end
+                self._rtap = nil
+                self:snapshot(); self._burst = nil
+                self:removeHighlightAt(hrow, hcol)
+                self:save()
+                self:refresh{ lines = { hrow, hrow } }
+                return true
+            end
+        end
         -- Taps near the L/R/bottom edge are page-turns (likely scrolling), never
         -- an exit gesture -- page immediately, no double-tap delay.
         if p.x < MDEDIT_READER_EDGE or p.x > self.fw - MDEDIT_READER_EDGE
@@ -2697,13 +4445,20 @@ function MDEdit:onPan(_, ges)
     reset = function()
         if self._pan_reset == reset then
             self._pan_reset = nil
+            if self.reader_mode and self._pan_mode == "rselect" then
+                self._pan_active = nil
+                self._pan_paged = nil
+                self._pan_mode = nil
+                self:commitHighlightFromSelection()
+                return
+            end
             self._pan_active = nil
             self._pan_paged = nil
             self._pan_mode = nil
         end
     end
     self._pan_reset = reset
-    UIManager:scheduleIn(0.35, reset)
+    UIManager:scheduleIn(self.reader_mode and 1.25 or 0.35, reset)
     local is_new_pan = not self._pan_active
         or (ges.start_pos and self._pan_start_x
             and (math.abs(sp.x - self._pan_start_x) > 2 or math.abs(sp.y - self._pan_start_y) > 2))
@@ -2713,11 +4468,39 @@ function MDEdit:onPan(_, ges)
         self._pan_mode, self._pan_last_y, self._pan_paged = nil, sp.y, false
     end
     if self.reader_mode then
-        -- One page turn per drag, then latch until the finger lifts.
-        local dy = p.y - sp.y
-        if not self._pan_paged and math.abs(dy) >= MDEDIT_PAGE_PAN_MIN then
-            self._pan_paged = true
-            if dy < 0 then self:pageDown() else self:pageUp() end
+        local dx, dy = p.x - sp.x, p.y - sp.y
+        local adx, ady = math.abs(dx), math.abs(dy)
+        -- Already committed this drag to selecting: extend the selection to the
+        -- finger, following it across lines. Vertical motion no longer pages here
+        -- (the mode is latched), which is what lets a highlight span multiple lines.
+        if self._pan_mode == "rselect" then
+            local row, col = self:pointToCursor(p)
+            self.crow, self.ccol = row, col
+            self._manual_scroll_cursor = { row = row, col = col }
+            self:refresh{ layout_dirty = false, selection = true }
+            return true
+        end
+        if self._pan_mode == "rpage" then return true end
+        if not self._pan_mode then
+            if math.max(adx, ady) < MDEDIT_SELECT_PAN_MIN then return true end
+            if adx >= ady * 1.2 then
+                -- Horizontal-dominant start -> select text (to become a highlight).
+                self._pan_mode = "rselect"
+                local sr, sc = self:pointToCursor(sp)
+                self.sel = { row = sr, col = sc }
+                local row, col = self:pointToCursor(p)
+                self.crow, self.ccol = row, col
+                self._manual_scroll_cursor = { row = row, col = col }
+                self:refresh{ layout_dirty = false, selection = true }
+            else
+                -- Vertical-dominant start -> page (one turn per drag, then latch).
+                self._pan_mode = "rpage"
+                self.sel = nil
+                if not self._pan_paged and ady >= MDEDIT_PAGE_PAN_MIN then
+                    self._pan_paged = true
+                    if dy < 0 then self:pageDown() else self:pageUp() end
+                end
+            end
         end
         return true
     end
@@ -2759,12 +4542,115 @@ function MDEdit:onPan(_, ges)
     end
     local row, col = self:pointToCursor(p)
     self.crow, self.ccol = row, col
+    -- The finger is placing the cursor, so pin the viewport to it (same as a tap):
+    -- without this, rebuild() auto-scrolls to chase the cursor whenever the drag
+    -- crosses onto an off-screen or partially-visible line. Next to a tall table
+    -- that scroll is a full page jump, so a select-drag near a table reads as the
+    -- page navigating up or down depending on which side of the fold the line sits.
+    self._manual_scroll_cursor = { row = row, col = col }
     self:refresh{ layout_dirty = false, selection = true }
+    return true
+end
+-- Finger lifted after a (slow) pan. In reader mode this ends a text selection, so
+-- turn whatever was selected into a ==highlight==. Edit-mode selections persist
+-- (cleared by the next tap), matching the previous behaviour.
+function MDEdit:onPanRelease(_, ges)
+    if self.reader_mode and self._pan_mode == "rselect" then
+        self._pan_mode = nil
+        self:commitHighlightFromSelection()
+        return true
+    end
+    return false   -- let other handlers (movable dialogs, etc.) see non-select releases
+end
+-- Wrap the current selection in == == markers, one span per logical line so a
+-- multi-line selection produces valid per-line highlights. Whitespace at the ends
+-- of each wrapped slice is left outside the markers, then the saved highlight is
+-- expanded to the touched word boundaries so it never starts/stops mid-word.
+function MDEdit:commitHighlightFromSelection()
+    if not self:hasSel() then self.sel = nil; return self:refresh{ layout_dirty = false, selection = true } end
+    local lr, lc, hr, hc = self:selRange()
+    local function highlight_ranges(line, a, b)
+        local toks = md_tokenize(line)[1]
+        local byte, ranges = 0, {}
+        for _, span in ipairs(toks.spans or {}) do
+            local raw = span.text or ""
+            local display = span.display
+            if display == nil then display = raw end
+            local start_col, end_col = byte, byte + #raw
+            if display ~= "" and span.style ~= "syntax" and span.style ~= "bullet" and span.style ~= "task" then
+                if end_col > a and start_col < b then
+                    local from = math.max(0, math.min(#raw, a - start_col))
+                    local to = math.max(0, math.min(#raw, b - start_col))
+                    local lo = prev_word_col(raw, from)
+                    local hi = next_word_col(raw, to)
+                    if lo == hi and #raw > 0 then lo, hi = 0, #raw end
+                    if hi == 0 and #raw > 0 then hi = #raw end
+                    if hi > lo then ranges[#ranges+1] = { start_col + lo, start_col + hi } end
+                end
+            end
+            byte = end_col
+        end
+        return ranges
+    end
+    local function wrap_range(li, a, b)
+        local line = self.lines[li]
+        if not line then return end
+        a = math.max(0, math.min(a, #line)); b = math.max(a, math.min(b, #line))
+        local ranges = highlight_ranges(line, a, b)
+        for k = #ranges, 1, -1 do
+            local ra, rb = ranges[k][1], ranges[k][2]
+            local slice = line:sub(ra + 1, rb)
+            if not slice:find("==", 1, true) then         -- avoid nesting/doubling markers
+                line = line:sub(1, ra) .. "==" .. slice .. "==" .. line:sub(rb + 1)
+            end
+        end
+        self.lines[li] = line
+    end
+    self:snapshot(); self._burst = nil
+    if lr == hr then
+        wrap_range(lr, lc, hc)
+    else
+        -- Back-to-front so each edit leaves earlier lines' byte offsets intact.
+        wrap_range(hr, 0, hc)
+        for k = hr - 1, lr + 1, -1 do wrap_range(k, 0, #self.lines[k]) end
+        wrap_range(lr, lc, #self.lines[lr])
+    end
+    self.sel = nil
+    self:save()
+    -- Only the wrapped lines changed (== is zero-width, so wrapping is unaffected);
+    -- repaint just those rows rather than flashing the whole screen.
+    self:refresh{ lines = { lr, hr } }
+end
+-- If byte column `col` on line `line_i` falls inside a ==...== region, return the
+-- 1-based byte indices of the opening and closing '==' markers; else nil.
+function MDEdit:highlightRangeAt(line_i, col)
+    local line = self.lines[line_i]
+    if not line then return nil end
+    local pos = 1
+    while true do
+        local s = line:find("==", pos, true)
+        if not s then return nil end
+        local e = line:find("==", s + 2, true)
+        if not e then return nil end
+        -- Hit if the cursor byte offset lands anywhere from the opening marker
+        -- through the closing marker (inclusive of both == pairs).
+        if col >= s - 1 and col <= e + 1 then return s, e end
+        pos = e + 2
+    end
+end
+-- Strip the ==...== markers of the highlight containing `col`, keeping the text.
+function MDEdit:removeHighlightAt(line_i, col)
+    local s, e = self:highlightRangeAt(line_i, col)
+    if not s then return false end
+    local line = self.lines[line_i]
+    line = line:sub(1, e - 1) .. line:sub(e + 2)          -- drop closing == first (higher index)
+    line = line:sub(1, s - 1) .. line:sub(s + 2)          -- then the opening ==
+    self.lines[line_i] = line
     return true
 end
 
 -- ============================ Minfolio (native KOReader) ============================
-local function edit_note(path)
+local function edit_note(path, remote)
     fl_restore_if_needed()
     if active_mdedit and not active_mdedit._closing then
         -- Already editing this exact file: keep the live editor (with its cursor
@@ -2779,11 +4665,49 @@ local function edit_note(path)
     -- Closing the document always returns to the Minfolio file listing at the
     -- note's folder -- even when the note was opened by a send from the computer
     -- (launch flag), which otherwise would drop back to KOReader.
-    local ed = MDEdit:new{ path = path, on_close = function()
+    local ed = MDEdit:new{ path = path, remote = remote, on_close = function()
         if show_file_manager then show_file_manager(path_parent(path)) end
     end }
     active_mdedit = ed
     UIManager:show(ed, "full")   -- "full" forces a complete repaint over the menu
+    -- Closing the file browser and showing the editor each queue their own dirty
+    -- updates.  Reassert the editor after that transition has drained so a
+    -- browser-region update cannot win and leave a partially blank launch view.
+    UIManager:scheduleIn(0.12, function()
+        if active_mdedit == ed and not ed._closing then
+            UIManager:setDirty(ed, "full")
+        end
+    end)
+end
+
+function MinfolioRemote.edit(descriptor_path)
+    local ok, cfg = pcall(dofile, descriptor_path)
+    if not ok or type(cfg) ~= "table" or type(cfg.host) ~= "string" or type(cfg.port) ~= "number" then
+        notify(_("Invalid secure desktop editing session")); return
+    end
+    if type(cfg.session_id) ~= "string" or not cfg.session_id:match("^[A-Za-z0-9_-]+$")
+        or type(cfg.token) ~= "string" or type(cfg.cert_fingerprint) ~= "string" then
+        notify(_("Invalid secure desktop editing session")); return
+    end
+    lfs.mkdir(STATE_DIR)
+    local expected_directory = MINFOLIO_REMOTE_DIR .. "/" .. cfg.session_id
+    if cfg.directory ~= expected_directory then notify(_("Invalid secure desktop editing session")); return end
+    lfs.mkdir(MINFOLIO_REMOTE_DIR); lfs.mkdir(cfg.directory)
+    local shadow = cfg.directory .. "/document.md"
+    cfg.outbox_path = cfg.directory .. "/outbox.md"
+    cfg.inbox_path = cfg.directory .. "/inbox.md"
+    cfg.revision_path = cfg.directory .. "/revision"
+    cfg.closing_path = cfg.directory .. "/closing"
+    -- The initial content arrives over the existing encrypted SSH launch command.
+    -- It is written before MDEdit is constructed, so the editor never opens blank.
+    if not read_file(shadow) then write_file(shadow, type(cfg.content) == "string" and cfg.content or "") end
+    edit_note(shadow, cfg)
+end
+
+function MinfolioRemote.stop(session_id)
+    if active_mdedit and active_mdedit.remote and active_mdedit.remote.session_id == session_id then
+        active_mdedit:saveAndClose()
+    end
 end
 
 -- Rotates the whole device screen 90° counter-clockwise (repeat to cycle through
@@ -2893,10 +4817,29 @@ open_markdown_picker = function(start_dir)
 end
 
 local function refresh_file_manager(menu, dir)
-    if menu then UIManager:close(menu) end
+    -- Folder navigation replaces the current Menu's item table. Keeping one
+    -- window avoids a growing KOReader widget stack and preserves the current
+    -- browser instead of looking like every folder opened a new screen.
+    if menu and menu.minfolioNavigate then return menu:minfolioNavigate(dir) end
     show_file_manager(dir)
 end
 
+-- Let a name-entry dialog toggle its on-screen keyboard by swiping: up shows it,
+-- down hides it. Handy when a Bluetooth keyboard is attached and the on-screen
+-- one is just wasting space (swipe down), or you want it back (swipe up).
+local function attach_kbd_swipe(dlg)
+    dlg.ges_events = dlg.ges_events or {}
+    dlg.ges_events.MinfolioKbdSwipe = {
+        GestureRange:new{ ges = "swipe",
+            range = Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight() } },
+    }
+    function dlg:onMinfolioKbdSwipe(_, ges)
+        local d = ges and ges.direction
+        if d == "north" then self:onShowKeyboard()
+        elseif d == "south" then self:onCloseKeyboard() end
+        return true
+    end
+end
 local function show_new_entry_dialog(menu, dir, kind)
     local is_folder = kind == "folder"
     local dlg
@@ -2928,6 +4871,7 @@ local function show_new_entry_dialog(menu, dir, kind)
             end },
         }},
     }
+    attach_kbd_swipe(dlg)
     UIManager:show(dlg)
     dlg:onShowKeyboard()
 end
@@ -2954,6 +4898,7 @@ local function show_rename_dialog(parent_menu, dir, item)
             end },
         }},
     }
+    attach_kbd_swipe(dlg)
     UIManager:show(dlg)
     dlg:onShowKeyboard()
 end
@@ -3034,10 +4979,16 @@ show_file_manager = function(start_dir)
     -- of the close (X) icon. TitleBar only exposes a single right icon (the close
     -- button), so the battery is added as an extra right-aligned overlap child.
     local title_text = _("Minfolio") .. " - " .. (dir == NOTES_DIR and path_base(NOTES_DIR) or dir)
+    local batt_info = battery_info()
+    -- TitleBar knows about its close icon but not the extra battery widget we
+    -- overlay on the right. Reserve that whole region in its title layout so a
+    -- long folder path is ellipsized before it can paint underneath the percent.
+    local battery_title_reserve = batt_info and (MinfolioBattery.indicatorWidth() + Screen:scaleBySize(44)) or 0
     local title_bar = TitleBar:new{
         width = Screen:getWidth(),
         align = "center",
         title = title_text,
+        title_h_padding = Size.padding.large + battery_title_reserve,
         with_bottom_line = true,
         left_icon = "appbar.menu",
         left_icon_tap_callback = function()
@@ -3045,12 +4996,13 @@ show_file_manager = function(start_dir)
         end,
         close_callback = function() if menu then menu:onClose() end end,
     }
-    local batt = battery_indicator()
+    local batt = battery_indicator(batt_info)
+    local batt_cell
     if batt then
         -- Vertically centered in the title bar, then nudged up ~8px: shrinking the
         -- centering box's height by 16 raises the centered battery by half that.
-        local batt_cell = CenterContainer:new{
-            dimen = Geom:new{ w = batt:getSize().w, h = math.max(1, title_bar:getHeight() - 16) }, batt }
+        batt_cell = CenterContainer:new{
+            dimen = Geom:new{ w = MinfolioBattery.indicatorWidth(), h = math.max(1, title_bar:getHeight() - 16) }, batt }
         table.insert(title_bar, HorizontalGroup:new{
             align = "center", overlap_align = "right",
             batt_cell, HorizontalSpan:new{ width = Screen:scaleBySize(44) },
@@ -3063,11 +5015,12 @@ show_file_manager = function(start_dir)
         handle_hold_on_hold_release = true,
         custom_title_bar = title_bar,
         onMenuSelect = function(_self, item)
+            local current_dir = _self._minfolio_dir or dir
             -- The editor is fullscreen and returns here via its on_close, so close
             -- this listing rather than leaving it stacked underneath.
-            if item.kind == "new_note" then show_new_entry_dialog(menu, dir, "note")
-            elseif item.kind == "new_folder" then show_new_entry_dialog(menu, dir, "folder")
-            elseif item.is_open then open_markdown_picker(dir)
+            if item.kind == "new_note" then show_new_entry_dialog(menu, current_dir, "note")
+            elseif item.kind == "new_folder" then show_new_entry_dialog(menu, current_dir, "folder")
+            elseif item.is_open then open_markdown_picker(current_dir)
             elseif item.kind == "dir_nav" then refresh_file_manager(menu, item.path)
             elseif item.kind == "dir" then refresh_file_manager(menu, item.path)
             elseif item.kind == "file" then
@@ -3079,14 +5032,81 @@ show_file_manager = function(start_dir)
             if item and item.hold_callback then
                 item.hold_callback()
             elseif item and (item.kind == "dir" or item.kind == "file") then
-                show_item_actions(menu, dir, item)
+                show_item_actions(menu, _self._minfolio_dir or dir, item)
             end
             return true
         end,
     }
+    menu._minfolio_dir = dir
+    function menu:minfolioNavigate(next_dir)
+        if lfs.attributes(next_dir, "mode") ~= "directory" then return end
+        local next_dirs, next_files, readable = dir_entries(next_dir)
+        local next_items = {
+            { text = "＋ " .. _("New note"), kind = "new_note" },
+            { text = "＋ " .. _("New folder"), kind = "new_folder" },
+            { text = _("Open .md file..."), is_open = true },
+        }
+        if next_dir ~= NOTES_DIR then next_items[#next_items+1] = { text = "../", kind = "dir_nav", path = path_parent(next_dir) } end
+        for _, name in ipairs(next_dirs) do
+            local item = { text = name .. "/", kind = "dir", name = name, path = path_join(next_dir, name) }
+            item.hold_callback = function() show_item_actions(self, next_dir, item) end
+            next_items[#next_items+1] = item
+        end
+        for _, name in ipairs(next_files) do
+            local item = { text = name, kind = "file", name = name, path = path_join(next_dir, name) }
+            item.hold_callback = function() show_item_actions(self, next_dir, item) end
+            next_items[#next_items+1] = item
+        end
+        if not readable then next_items[#next_items+1] = { text = _("Cannot read this folder"), kind = "noop" } end
+        self._minfolio_dir = next_dir
+        local next_title = _("Minfolio") .. " - " .. (next_dir == NOTES_DIR and path_base(NOTES_DIR) or next_dir)
+        self:switchItemTable(next_title, next_items)
+        logger.info("minfolio file manager navigated:", next_dir)
+    end
+    if batt_cell then
+        menu._battery_key = MinfolioBattery.infoKey(batt_info)
+        local function schedule_battery_refresh()
+            local fn
+            fn = function()
+                if menu._battery_refresh_pending == fn then menu._battery_refresh_pending = nil end
+                if menu._battery_closed then return end
+                local info = battery_info()
+                local key = MinfolioBattery.infoKey(info)
+                if info and key ~= menu._battery_key then
+                    if batt_cell[1] and batt_cell[1].free then batt_cell[1]:free() end
+                    batt_cell[1] = battery_indicator(info)
+                    menu._battery_key = key
+                    UIManager:setDirty(menu, "ui")
+                end
+                schedule_battery_refresh()
+            end
+            menu._battery_refresh_pending = fn
+            UIManager:scheduleIn(MinfolioBattery.refresh_interval, fn)
+        end
+        local original_close = menu.onCloseWidget
+        function menu:onCloseWidget()
+            self._battery_closed = true
+            if self._battery_refresh_pending then
+                UIManager:unschedule(self._battery_refresh_pending)
+                self._battery_refresh_pending = nil
+            end
+            if original_close then original_close(self) end
+        end
+        schedule_battery_refresh()
+    end
     title_bar.show_parent = menu
     if title_bar.left_button then title_bar.left_button.show_parent = menu end
     if title_bar.right_button then title_bar.right_button.show_parent = menu end
+    -- KOReader's Menu closes on a south swipe, so swiping in the blank space
+    -- dismisses the whole browser unexpectedly. Keep only left/right for paging
+    -- and ignore vertical/diagonal swipes -- the X in the title bar is the way to
+    -- close.
+    function menu:onSwipe(_, ges)
+        local d = ges and ges.direction
+        if d == "west" then self:onNextPage()
+        elseif d == "east" then self:onPrevPage() end
+        return true
+    end
     UIManager:show(menu)
 end
 
@@ -3112,6 +5132,12 @@ function Minfolio:openLaunchTarget(target)
     elseif target:match("^edit:") then                  -- open a specific file in the editor
         local path = target:sub(6)
         UIManager:scheduleIn(0.1, function() edit_note(path) end)
+    elseif target:match("^remote:") then
+        local descriptor = target:sub(8)
+        UIManager:scheduleIn(0.1, function() MinfolioRemote.edit(descriptor) end)
+    elseif target:match("^remote%-stop:") then
+        local session_id = target:sub(13)
+        UIManager:scheduleIn(0.1, function() MinfolioRemote.stop(session_id) end)
     end
 end
 
@@ -3125,10 +5151,12 @@ function Minfolio:pollLaunchFlag()
 end
 
 function Minfolio:onResume()
-    -- The Kindle framework owns the light; resync labels/state and repaint after
-    -- the screensaver/framework wake transition settles.
-    fl_restore_if_needed()
+    -- Both operations wait for the screensaver/framework wake transition to settle.
+    FL.scheduleWakeSync()
     schedule_wake_repaint()
+end
+function Minfolio:onSuspend()
+    FL.captureBeforeSuspend()
 end
 
 function Minfolio:onDispatcherRegisterActions()
@@ -3138,6 +5166,7 @@ end
 
 function Minfolio:init()
     install_keyboard_aliases()
+    MinfolioPair.start()
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
     if not _G.__minfolio_launch_polling then
